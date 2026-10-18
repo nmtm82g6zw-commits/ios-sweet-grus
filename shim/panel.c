@@ -124,18 +124,21 @@ int panel_init(struct panel_info *pi)
 		pi->bpp = ((pi->src_format >> 9) & 3) + 1;
 	/* The console draws in whatever the pipe now scans. */
 	con_set_format(pi->bpp, pi->sspp >= 0 ? pi->src_stride : 0);
-	if (pi->pp < 0) {
+	if (pi->pp < 0)
+		return -1;	/* no tear check: nothing to drive the panel with */
+	pi->pp_ar_before = rd32(PP(pi->pp) + PP_AUTOREFRESH);
+	/*
+	 * grus ABL already runs autorefresh (0x80000001: every TE). Rewriting
+	 * it and kicking CTL_START while it runs corrupts the pipe: the panel
+	 * shows a striped band and stops updating (measured 2026-10-18, diag
+	 * v7). So only switch it on when it is off.
+	 */
+	if (!(pi->pp_ar_before & (1U << 31))) {
+		wr32(PP(pi->pp) + PP_AUTOREFRESH, (1U << 31) | 1);
 		if (pi->ctl >= 0)
 			wr32(CTL(pi->ctl) + CTL_START, 1);
-		return -1;	/* no tear check: autorefresh would never fire */
 	}
-	pi->pp_ar_before = rd32(PP(pi->pp) + PP_AUTOREFRESH);
-	/* Every TE (frame count 1), like the Linux SDE autorefresh path. */
-	wr32(PP(pi->pp) + PP_AUTOREFRESH, (1U << 31) | 1);
 	pi->pp_ar_after = rd32(PP(pi->pp) + PP_AUTOREFRESH);
-	/* Autorefresh starts with the next kickoff. */
-	if (pi->ctl >= 0)
-		wr32(CTL(pi->ctl) + CTL_START, 1);
 	return 0;
 }
 

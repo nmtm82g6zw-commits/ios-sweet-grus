@@ -419,7 +419,7 @@ void shim_main(uint64_t dtb)
 		uint32_t pnew = probe[0];
 		probe[0] = pold;
 		con_set_format(4, FB_STRIDE);
-		con_str("DIAG", "grus shim diag v7");
+		con_str("DIAG", "grus shim diag v8");
 		for (int i = 0; i < 6; i++)
 			con_hex2("FBPIX", "xy=", fx[i] << 16 | fy[i], "v=", fpix[i]);
 		con_hex2("FBNZ", "nonzero=", fnz, "of=", (uint32_t)(FB_STRIDE * FB_H / (4 * 97)));
