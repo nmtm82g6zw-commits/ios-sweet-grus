@@ -12,6 +12,8 @@ struct panel_info {
 	int ctl, pp, sspp;		/* -1 when not found */
 	uint32_t ctl_top, pp_te, pp_ar_before, pp_ar_after;
 	uint32_t src_addr, src_stride, src_format, src_size;
+	uint32_t fmt_before, unpack_before, stride_before;	/* splash as ABL left it */
+	int converted;		/* 1: RGB888 splash switched to XRGB8888 */
 };
 
 int panel_init(struct panel_info *pi);
