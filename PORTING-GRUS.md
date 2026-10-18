@@ -25,7 +25,7 @@ boots to be bring-up boots.
 | Touch | GT9896 Yellowstone @0x5d, SE 0xa84000 | **GT9886 normandy** @0x5d, same SE 0xa84000, same GCC clocks | `sweet_touch.c` |
 | Touch pins | reset 8, irq 9, i2c 6/7, power gpio 90 | reset **5**, irq **125**, i2c 6/7 (qup9, mux 1), no power gpio | `sweet_touch.c` |
 | Touch rails | L11C 3.2 V | **L8B 3.3 V** (vtouch) + **L13A 1.8 V** (iotouch) | `sweet_touch.c`, `sweet_rpmh.c` |
-| Touch orientation | as is | x2x + y2y (rotated 180) | `sweet_touch.c` |
+| Touch orientation | as is | boot-arg `sweettouchorient` (bit 0 mirrors x, bit 1 mirrors y; default none). The DT x2x/y2y (both mirrored) was inverted on a real grus | `sweet_touch.c` |
 | USB GCC CBCRs | master 0xf010 ... | master 0xf00c, sleep 0xf010, utmi 0xf014, clkref 0x8c008 | `sweet_usb.c` |
 | Battery | PM6150 FG readout (opt-in) | static only (PM660 FG gen3 + BQ2591x) | `SweetBattery.cpp` |
 

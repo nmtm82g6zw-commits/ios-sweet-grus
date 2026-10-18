@@ -183,7 +183,7 @@ index 03defe6..2fe31f3 100644
 +#if defined(SWEET_BOARD_GRUS)
 +/* grus-sdm710.dtsi: normandy-i2c@5d, reset gpio5, irq gpio125 (pull-up),
 + * qupv3_se9_i2c_active gpio6/7 function qup9 (mux 1), vtouch pm660l_l8
-+ * (RPMh ldob8, 3.3 V), iotouch pm660_l13 (ldoa13, 1.8 V), x2x + y2y. */
++ * (RPMh ldob8, 3.3 V), iotouch pm660_l13 (ldoa13, 1.8 V); orientation via sweettouchorient. */
 +#define TOUCH_RST_PIN    5u
 +#define TOUCH_IRQ_PIN    125u
 +#define TOUCH_GPIO_MAP   0x80000u    /* NORTH pins up to 127 */
@@ -308,9 +308,9 @@ index 03defe6..2fe31f3 100644
 +			return EIO;
 +		}
 +		mask |= 1u << id;
-+		/* DT goodix,x2x and goodix,y2y: the controller is mounted rotated 180. */
-+		x[id] = (int)(SWEET_PANEL_W - 1u - px);
-+		y[id] = (int)(SWEET_PANEL_H - 1u - py);
++		static int orient = -1; /* boot-arg sweettouchorient: bit 0 mirrors x, bit 1 mirrors y; default none */
++		if (orient < 0 && !PE_parse_boot_argn("sweettouchorient", &orient, sizeof(orient))) { orient = 0; }
++		x[id] = (int)((orient & 1) ? SWEET_PANEL_W - 1u - px : px); y[id] = (int)((orient & 2) ? SWEET_PANEL_H - 1u - py : py);
 +	}
 +	err = touch_gt9886_ack();
 +	if (!err) {
