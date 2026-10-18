@@ -36,7 +36,7 @@ grus) DTB=${DTB:-../dtb/grus/dtb}; CFLAGS="$CFLAGS -DBOARD_GRUS" ;;
 *) echo "error: unknown BOARD=$BOARD (sweet, grus)" >&2; exit 1 ;;
 esac
 OBJS="shim console mmu fdt loader ufs panel"
-rm -rf out/*.o
+rm -f out/*.o 2>/dev/null || true	# objects are rewritten anyway
 mkdir -p out
 $CC $CFLAGS -c start.S -o out/start.o
 for f in $OBJS; do
