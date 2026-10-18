@@ -120,31 +120,6 @@ int panel_init(struct panel_info *pi)
 			break;
 		}
 	}
-	/* RGB888 splash (3 bytes/pixel, packed rows) -> XRGB8888, rows of FB_STRIDE. */
-	if (pi->sspp >= 0 && ((pi->src_format & FMT_BPP_MASK) >> 9) == 2 &&
-	    pi->src_stride == FB_W * 3) {
-		uintptr_t s = sspp_base(pi->sspp);
-		uint32_t fmt = pi->src_format, unpack = rd32(s + SSPP_SRC_UNPACK);
-		pi->fmt_before = fmt;
-		pi->unpack_before = unpack;
-		pi->stride_before = pi->src_stride;
-		fmt &= ~(FMT_BPP_MASK | FMT_UNPACK_CNT_MASK | FMT_ALPHA_EN | FMT_C3_BITS(3U));
-		fmt |= (3U << 9) | (3U << 12) | FMT_C3_BITS(3U);
-		unpack = (unpack & 0x00ffffffU) | (3U << 24);	/* element[3] = C3 (X) */
-		/* Black first, so the switch never shows a garbage frame. */
-		for (uintptr_t a = FB_PHYS; a < FB_PHYS + (uintptr_t)FB_STRIDE * FB_H; a += 8)
-			*(volatile uint64_t *)a = 0xff000000ff000000ULL;
-		wr32(s + SSPP_SRC_YSTRIDE0, (rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff0000U) | FB_STRIDE);
-		wr32(s + SSPP_SRC_UNPACK, unpack);
-		wr32(s + SSPP_SRC_FORMAT, fmt);
-		if (pi->ctl >= 0)
-			wr32(CTL(pi->ctl) + CTL_FLUSH, sspp_flush_bit(pi->sspp));
-		if (pi->ctl >= 0)
-			wr32(CTL(pi->ctl) + CTL_START, 1);
-		pi->src_format = rd32(s + SSPP_SRC_FORMAT);
-		pi->src_stride = rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff;
-		pi->converted = 1;
-	}
 	if (pi->sspp >= 0)
 		pi->bpp = ((pi->src_format >> 9) & 3) + 1;
 	/* The console draws in whatever the pipe now scans. */
@@ -161,6 +136,37 @@ int panel_init(struct panel_info *pi)
 	/* Autorefresh starts with the next kickoff. */
 	if (pi->ctl >= 0)
 		wr32(CTL(pi->ctl) + CTL_START, 1);
+	return 0;
+}
+
+int panel_to_xrgb(struct panel_info *pi)
+{
+	/* RGB888 splash (3 bytes/pixel, packed rows) -> XRGB8888, rows of FB_STRIDE. */
+	if (pi->sspp >= 0 && ((pi->src_format & FMT_BPP_MASK) >> 9) == 2 &&
+	    pi->src_stride == FB_W * 3) {
+		uintptr_t s = sspp_base(pi->sspp);
+		uint32_t fmt = pi->src_format, unpack = rd32(s + SSPP_SRC_UNPACK);
+		pi->fmt_before = fmt;
+		pi->unpack_before = unpack;
+		pi->stride_before = pi->src_stride;
+		fmt &= ~(FMT_BPP_MASK | FMT_UNPACK_CNT_MASK | FMT_ALPHA_EN | FMT_C3_BITS(3U));
+		fmt |= (3U << 9) | (3U << 12) | FMT_C3_BITS(3U);
+		unpack = (unpack & 0x00ffffffU) | (3U << 24);	/* element[3] = C3 (X) */
+		wr32(s + SSPP_SRC_YSTRIDE0, (rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff0000U) | FB_STRIDE);
+		wr32(s + SSPP_SRC_UNPACK, unpack);
+		wr32(s + SSPP_SRC_FORMAT, fmt);
+		if (pi->ctl >= 0)
+			wr32(CTL(pi->ctl) + CTL_FLUSH, sspp_flush_bit(pi->sspp));
+		if (pi->ctl >= 0)
+			wr32(CTL(pi->ctl) + CTL_START, 1);
+		pi->src_format = rd32(s + SSPP_SRC_FORMAT);
+		pi->src_stride = rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff;
+		pi->converted = 1;
+	}
+	if (!pi->converted)
+		return -1;
+	pi->bpp = 4;
+	con_set_format(4, FB_STRIDE);
 	return 0;
 }
 
@@ -194,6 +200,12 @@ int panel_init(struct panel_info *pi)
 	pi->ctl = pi->pp = pi->sspp = -1;
 	pi->bpp = 4;
 	con_set_format(4, FB_STRIDE);
+	return 0;
+}
+
+int panel_to_xrgb(struct panel_info *pi)
+{
+	(void)pi;
 	return 0;
 }
 

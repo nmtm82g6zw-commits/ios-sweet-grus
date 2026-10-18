@@ -19,4 +19,6 @@ struct panel_info {
 };
 
 int panel_init(struct panel_info *pi);
+/* Switch an RGB888 splash pipe to XRGB8888 (FB_STRIDE); 0 if done. */
+int panel_to_xrgb(struct panel_info *pi);
 void panel_report(const struct panel_info *pi);

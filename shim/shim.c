@@ -410,6 +410,20 @@ void shim_main(uint64_t dtb)
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
+	if (BOARD_CMD_PANEL && pi.bpp == 3) {
+		con_str("NEXT", "32bpp test in 60 s");
+		delay_ms(60000);
+		stage = "xrgb";
+		if (panel_to_xrgb(&pi) == 0) {
+			con_clear(RED);
+			con_str("XRGB", "32bpp OK if this is readable on red");
+			con_hex2(" fmt", "now=", pi.src_format, "st=", pi.src_stride);
+		} else {
+			con_str("XRGB", "switch not attempted");
+		}
+		delay_ms(120000);
+		reset(20);
+	}
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
