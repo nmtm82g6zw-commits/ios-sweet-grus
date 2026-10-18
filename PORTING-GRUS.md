@@ -105,13 +105,44 @@ on grus that is expected but unverified (the shim's UFS probe and the kernel's
    `SWEET RPMH: rsc=0x179e0000 ...`, `SWEET TOUCH: probe 0x5d ...` in the log.
 4. Then `cpus=6`, `sweetfb_noconsole=1`.
 
-## Unverified assumptions (check these first)
+## Measured on the phone (2026-10-18)
 
-- ABL's splash format on grus is 32 bpp, stride 4320 (shim `sspp stride`).
-- The tear check is enabled by ABL, so autorefresh has a TE to run on.
-- GT9886 coordinates are at 0x4100 (from the vendor tools and test code; the
-  real address is in the vendor `goodix_gt9886_cfg_f2.bin`). The PID dump
-  at 0x4535 is only logged.
-- The 6 GiB part's upper bank size (use the shim or `fdt-ram.py`).
-- PMIC GPIO7 of PM660L is configured as an input by firmware (the driver
-  checks and withholds volume up otherwise; it never reconfigures the PMIC).
+First bring-up on a real Mi 9 SE (6 GB, ROM with an Android 11 boot.img):
+
+- **Boot image:** the stock `boot.img` is **header v2** (Image.gz, empty
+  ramdisk, 3 SoC DTBs in the dtb section, grus overlays in `dtbo`), not the
+  v1 Image.gz-dtb of the original MIUI tree. `tools/grus-stock-dtb.py`
+  handles both and records the version; `BOARD=grus shim/build.sh` follows it.
+- **RAM:** live `/memory` = `<0x80000000 2G>, <0x1_00000000 0xfd6c0000>`, no
+  static carve-out in the upper bank; `mkadt.py --board grus --highmem` now
+  uses the whole upper bank by default.
+- **Display:** ABL leaves SSPP0 (VIG0) scanning **ARGB8888 at 0x9c000000,
+  stride 4320**, CTL0 in command mode on DSI0 (INTF1), PP0 tear check on and
+  **autorefresh already enabled** (`0x80000001`), apps-SMMU context for the
+  MDP with translation off (IOVA = PA). Writing into the buffer is enough;
+  touching the running autorefresh (rewrite + `CTL_START`) corrupts the pipe
+  (striped band, panel stops updating), so `panel_init()` only enables it
+  when it is off. Verified with full-screen red/green/blue bands.
+- **Hardware in the live tree:** EA8076 command-mode panel active
+  (`dsi_ss_ea8076_fhd_cmd_display`, no DSC, 1 LM / 1 INTF), Goodix
+  `normandy-i2c@5d` on `i2c@a84000` (reset 5, irq 125, L8B/L13A, x2x/y2y),
+  volume up PM660L GPIO7: all as assumed by patch 0079.
+- **Reset:** `reset()` lands in Android, not fastboot: grus ABL takes the
+  reboot reason from the PMIC, not from IMEM (to do).
+
+### Diagnostics without a screen
+
+Booted without a payload, the grus shim writes its report to the first
+64 KiB of the `logdump` partition (unused crash-dump area, LUN 0) after
+every stage: MDP/CTL/PP/SSPP/DSI and SMMU registers, splash contents, RAM.
+`run/04-readdiag.sh` (outside the repo) or simply
+`adb exec-out dd if=/dev/block/bootdevice/by-name/logdump bs=4096 count=16`
+from recovery reads it back (`SWEETDIAG1` header, then text).
+
+## Still unverified
+
+- GT9886 coordinates at `0x4100` (from the vendor tools and test code; the
+  real address is in the vendor `goodix_gt9886_cfg_f2.bin`).
+- PMIC GPIO7 of PM660L configured as an input by firmware (the driver checks
+  and withholds volume up otherwise; it never reconfigures the PMIC).
+- Everything the kernel does (no grus kernel boot yet).
