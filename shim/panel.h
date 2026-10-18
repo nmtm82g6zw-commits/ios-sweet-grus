@@ -14,6 +14,8 @@ struct panel_info {
 	uint32_t src_addr, src_stride, src_format, src_size;
 	uint32_t fmt_before, unpack_before, stride_before;	/* splash as ABL left it */
 	int converted;		/* 1: RGB888 splash switched to XRGB8888 */
+	int bpp;		/* bytes/pixel the pipe scans after panel_init (3 or 4) */
+	uint32_t pipe_addr[5], pipe_fmt[5], pipe_stride[5];
 };
 
 int panel_init(struct panel_info *pi);

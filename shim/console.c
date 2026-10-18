@@ -14,14 +14,34 @@
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
+static int con_bpp;		/* 0 = not set: 4 */
+static uint32_t con_stride;
+
+void con_set_format(int bytes_per_pixel, uint32_t stride)
+{
+	con_bpp = bytes_per_pixel == 3 ? 3 : 4;
+	con_stride = stride ? stride : (uint32_t)FB_W * con_bpp;
+}
+
+/* One pixel; c is 0xAARRGGBB, stored B,G,R(,A) like the splash formats. */
+static inline void put_px(int x, int y, uint32_t c)
+{
+	if (con_bpp == 3) {
+		volatile uint8_t *p = (volatile uint8_t *)FB_BASE + (uintptr_t)y * con_stride + (uintptr_t)x * 3;
+		p[0] = (uint8_t)c;
+		p[1] = (uint8_t)(c >> 8);
+		p[2] = (uint8_t)(c >> 16);
+	} else {
+		uint32_t st = con_stride ? con_stride : FB_STRIDE;
+		con_fb[(uintptr_t)y * (st / 4) + x] = c;
+	}
+}
 
 void con_clear(uint32_t bg)
 {
-	for (int y = 0; y < FB_H; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+	for (int y = 0; y < FB_H; y++)
 		for (int x = 0; x < FB_W; x++)
-			line[x] = bg;
-	}
+			put_px(x, y, bg);
 	con_bg = bg;
 	row = 0;
 }
@@ -37,12 +57,9 @@ static void put_char(int col, char ch, uint32_t fg)
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-						       + x0 + gx * SCALE;
+			for (int sy = 0; sy < SCALE; sy++)
 				for (int sx = 0; sx < SCALE; sx++)
-					p[sx] = c;
-			}
+					put_px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
 		}
 }
 
@@ -59,6 +76,20 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 	for (int i = 0; i < digits; i++)
 		buf[i] = hex[(v >> (4 * (digits - 1 - i))) & 0xf];
 	buf[digits] = 0;
+}
+
+/* Three 120x60 blocks, red / green / blue, on the current row: channel order check. */
+void con_color_bars(void)
+{
+	int y0 = MARGIN + row * CH_H;
+	for (int b = 0; b < 3; b++) {
+		uint32_t c = b == 0 ? 0xffff0000U : b == 1 ? 0xff00ff00U : 0xff0000ffU;
+		for (int y = y0; y < y0 + 2 * CH_H && y < FB_H; y++)
+			for (int x = MARGIN + 400 + b * 140; x < MARGIN + 520 + b * 140; x++)
+				put_px(x, y, c);
+	}
+	put_str(0, "RGB", YELLOW);
+	row += 2;
 }
 
 void con_skip(void)

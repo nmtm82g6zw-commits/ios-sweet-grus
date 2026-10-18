@@ -13,6 +13,10 @@
 
 extern volatile uint32_t *con_fb;
 
+/* Pixel layout the display really scans (grus ABL: 3 bytes, stride 3240). */
+void con_set_format(int bytes_per_pixel, uint32_t stride);
+void con_color_bars(void);
+
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);

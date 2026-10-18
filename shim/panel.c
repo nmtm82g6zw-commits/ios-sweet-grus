@@ -84,6 +84,7 @@ int panel_init(struct panel_info *pi)
 	pi->src_addr = pi->src_stride = pi->src_format = pi->src_size = 0;
 	pi->fmt_before = pi->unpack_before = pi->stride_before = 0;
 	pi->converted = 0;
+	pi->bpp = 4;
 
 	for (int n = 0; n < N_CTL; n++) {
 		uint32_t top = rd32(CTL(n) + CTL_TOP);
@@ -103,7 +104,14 @@ int panel_init(struct panel_info *pi)
 	}
 	for (int i = 0; i < N_SSPP; i++) {
 		uintptr_t s = sspp_base(i);
-		if (rd32(s + SSPP_SRC0_ADDR) == (uint32_t)FB_PHYS) {
+		pi->pipe_addr[i] = rd32(s + SSPP_SRC0_ADDR);
+		pi->pipe_fmt[i] = rd32(s + SSPP_SRC_FORMAT);
+		pi->pipe_stride[i] = rd32(s + SSPP_SRC_YSTRIDE0);
+	}
+	for (int i = 0; i < N_SSPP; i++) {
+		uintptr_t s = sspp_base(i);
+		uint32_t a = rd32(s + SSPP_SRC0_ADDR);
+		if (a >= (uint32_t)FB_PHYS && a < (uint32_t)(FB_PHYS + FB_SIZE)) {
 			pi->sspp = i;
 			pi->src_addr = rd32(s + SSPP_SRC0_ADDR);
 			pi->src_stride = rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff;
@@ -131,12 +139,21 @@ int panel_init(struct panel_info *pi)
 		wr32(s + SSPP_SRC_FORMAT, fmt);
 		if (pi->ctl >= 0)
 			wr32(CTL(pi->ctl) + CTL_FLUSH, sspp_flush_bit(pi->sspp));
+		if (pi->ctl >= 0)
+			wr32(CTL(pi->ctl) + CTL_START, 1);
 		pi->src_format = rd32(s + SSPP_SRC_FORMAT);
 		pi->src_stride = rd32(s + SSPP_SRC_YSTRIDE0) & 0xffff;
 		pi->converted = 1;
 	}
-	if (pi->pp < 0)
+	if (pi->sspp >= 0)
+		pi->bpp = ((pi->src_format >> 9) & 3) + 1;
+	/* The console draws in whatever the pipe now scans. */
+	con_set_format(pi->bpp, pi->sspp >= 0 ? pi->src_stride : 0);
+	if (pi->pp < 0) {
+		if (pi->ctl >= 0)
+			wr32(CTL(pi->ctl) + CTL_START, 1);
 		return -1;	/* no tear check: autorefresh would never fire */
+	}
 	pi->pp_ar_before = rd32(PP(pi->pp) + PP_AUTOREFRESH);
 	/* Every TE (frame count 1), like the Linux SDE autorefresh path. */
 	wr32(PP(pi->pp) + PP_AUTOREFRESH, (1U << 31) | 1);
@@ -155,6 +172,15 @@ void panel_report(const struct panel_info *pi)
 	con_hex2(" sspp", "n=", (uint32_t)pi->sspp, "addr=", pi->src_addr);
 	con_hex2(" sspp", "stride=", pi->src_stride, "fmt=", pi->src_format);
 	con_hex2(" sspp", "size=", pi->src_size, "want=", FB_STRIDE);
+	for (int i = 0; i < N_SSPP; i++)
+		if (pi->pipe_addr[i]) {
+			char l[] = " pipeN";
+			l[5] = '0' + i;
+			con_hex2(l, "a=", pi->pipe_addr[i], "f=", pi->pipe_fmt[i]);
+			con_hex2("      ", "st=", pi->pipe_stride[i], 0, 0);
+		}
+	con_hex2(" scan", "bpp=", (uint32_t)pi->bpp, "conv=", (uint32_t)pi->converted);
+	con_color_bars();
 	if (pi->converted) {
 		con_hex2(" rgb888", "fmt=", pi->fmt_before, "unpack=", pi->unpack_before);
 		con_hex2(" ->xrgb", "stride=", pi->stride_before, "now=", pi->src_stride);
@@ -166,6 +192,8 @@ void panel_report(const struct panel_info *pi)
 int panel_init(struct panel_info *pi)
 {
 	pi->ctl = pi->pp = pi->sspp = -1;
+	pi->bpp = 4;
+	con_set_format(4, FB_STRIDE);
 	return 0;
 }
 
