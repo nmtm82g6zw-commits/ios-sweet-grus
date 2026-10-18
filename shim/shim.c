@@ -406,7 +406,7 @@ void shim_main(uint64_t dtb)
 		int u;
 		stage = "diag";
 		con_set_format(4, FB_STRIDE);
-		con_str("DIAG", "grus shim diag v5");
+		con_str("DIAG", "grus shim diag v6");
 		con_hex2("CPU", "el=", (uint32_t)(rsr("CurrentEL") >> 2), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 		con_hex2("DTB", "at=", (uint32_t)dtb, "hi=", (uint32_t)(dtb >> 32));
 		show_memory(dtb);
@@ -418,6 +418,12 @@ void shim_main(uint64_t dtb)
 		ufs_save_log("2-before-mdp-read");
 		panel_dump();
 		ufs_save_log("3-mdp-read");
+		stage = "smmu";
+		con_str("STAGE", "SMMU for the MDP");
+		ufs_save_log("3a-before-smmu");
+		uint64_t fb_pa = smmu_dump();
+		con_hex2("FB PA", "hi=", (uint32_t)(fb_pa >> 32), "lo=", (uint32_t)fb_pa);
+		ufs_save_log("3b-smmu");
 		stage = "panel_init";
 		panel_init(&pi);
 		con_str("STAGE", "after panel_init");

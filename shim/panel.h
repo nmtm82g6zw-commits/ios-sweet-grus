@@ -24,5 +24,11 @@ int panel_to_xrgb(struct panel_info *pi);
 void panel_report(const struct panel_info *pi);
 /* Read-only dump of MDSS/MDP top, CTLs, PPs, SSPPs, layer mixers, DSI0. */
 void panel_dump(void);
+/*
+ * apps SMMU (0x15000000): stream-match entries for the MDP (SID 0x880 /
+ * 0xc80, mask 0x8), their context banks, and the page walk of the splash
+ * IOVA. Read-only. Returns the PA behind IOVA FB_PHYS, or 0.
+ */
+uint64_t smmu_dump(void);
 /* Short register dump for the format-independent windows. */
 void panel_report_short(const struct panel_info *pi);

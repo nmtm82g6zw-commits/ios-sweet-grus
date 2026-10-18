@@ -217,6 +217,87 @@ void panel_dump(void)
 	dump_block("FBmid", FB_PHYS + (uintptr_t)FB_W * 3 * (FB_H / 2), 0, 8);
 }
 
+#define SMMU_BASE	0x15000000UL
+static inline uint64_t rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
+
+/* AArch64 stage-1 walk, 4K granule; returns PA or 0, logs every level. */
+static uint64_t smmu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova)
+{
+	uint32_t t0sz = tcr & 0x3f, tg0 = (tcr >> 14) & 3;
+	if (tg0 != 0) {
+		con_hex2("WALK", "tg0=", tg0, "unsupported", 0);
+		return 0;
+	}
+	int va_bits = 64 - (int)t0sz;
+	int level = 4 - (va_bits - 12 + 8) / 9;
+	uint64_t table = ttbr & 0x0000fffffffff000ULL;
+	for (; level <= 3; level++) {
+		int shift = 12 + 9 * (3 - level);
+		uint64_t idx = (iova >> shift) & 0x1ff;
+		uint64_t d = rd64(table + idx * 8);
+		char l[] = "WALK L0";
+		l[6] = '0' + level;
+		con_hex2(l, "hi=", (uint32_t)(d >> 32), "lo=", (uint32_t)d);
+		if (!(d & 1))
+			return 0;
+		uint64_t oa = d & 0x0000fffffffff000ULL;
+		if (level == 3 || !(d & 2))	/* page, or block at L1/L2 */
+			return (oa & ~((1ULL << shift) - 1)) | (iova & ((1ULL << shift) - 1));
+		table = oa;
+	}
+	return 0;
+}
+
+uint64_t smmu_dump(void)
+{
+	uint32_t idr0 = rd32(SMMU_BASE + 0x20), idr1 = rd32(SMMU_BASE + 0x24);
+	uint32_t pgsz = (idr1 & (1U << 31)) ? 0x10000 : 0x1000;
+	uint32_t numpage = 1U << (((idr1 >> 28) & 7) + 1);
+	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
+	uint64_t pa = 0;
+
+	con_hex2("SMMU", "cr0=", rd32(SMMU_BASE + 0x0), "idr0=", idr0);
+	con_hex2("SMMU", "idr1=", idr1, "idr2=", rd32(SMMU_BASE + 0x28));
+	con_hex2("SMMU", "nsmr=", nsmr, "ncb=", ncb);
+	for (uint32_t n = 0; n < nsmr && n < 256; n++) {
+		uint32_t smr = rd32(SMMU_BASE + 0x800 + 4 * n);
+		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+		if (!(smr & (1U << 31)))
+			continue;
+		/* MDP stream IDs 0x880-0x888 / 0xc80-0xc88 */
+		if (((0x880 ^ id) & ~mask & 0x7ff0) && ((0xc80 ^ id) & ~mask & 0x7ff0))
+			continue;
+		uint32_t s2cr = rd32(SMMU_BASE + 0xc00 + 4 * n), cb = s2cr & 0xff;
+		con_hex2("SMR", "n=", n, "smr=", smr);
+		con_hex2(" S2CR", "v=", s2cr, "type=", (s2cr >> 16) & 3);
+		if (((s2cr >> 16) & 3) != 0 || cb >= ncb)
+			continue;
+		uintptr_t gr1 = SMMU_BASE + pgsz, cbb = SMMU_BASE + (uintptr_t)numpage * pgsz + (uintptr_t)cb * pgsz;
+		con_hex2(" CBAR", "v=", rd32(gr1 + 4 * cb), "cba2r=", rd32(gr1 + 0x800 + 4 * cb));
+		uint32_t sctlr = rd32(cbb + 0x0), tcr = rd32(cbb + 0x30);
+		uint64_t ttbr0 = rd64(cbb + 0x20);
+		con_hex2(" CB", "n=", cb, "sctlr=", sctlr);
+		con_hex2(" CB", "tcr=", tcr, "tcr2=", rd32(cbb + 0x10));
+		con_hex2(" TTBR0", "hi=", (uint32_t)(ttbr0 >> 32), "lo=", (uint32_t)ttbr0);
+		con_hex2(" MAIR", "0=", rd32(cbb + 0x38), "1=", rd32(cbb + 0x3c));
+		con_hex2(" FSR", "v=", rd32(cbb + 0x58), "far=", (uint32_t)rd64(cbb + 0x60));
+		if (!(sctlr & 1)) {
+			con_str(" CB", "translation off");
+			continue;
+		}
+		static const uint32_t probe[3] = {0, 0x500000, 0x9a0000};
+		for (int k = 0; k < 3; k++) {
+			uint64_t va = FB_PHYS + probe[k];
+			uint64_t p = smmu_walk(ttbr0, tcr, va);
+			con_hex2(" IOVA", "va=", (uint32_t)va, "pa=", (uint32_t)p);
+			con_hex2("", "pa_hi=", (uint32_t)(p >> 32), 0, 0);
+			if (k == 0 && p && !pa)
+				pa = p;
+		}
+	}
+	return pa;
+}
+
 void panel_report_short(const struct panel_info *pi)
 {
 	con_hex2("CTL", "n=", (uint32_t)pi->ctl, "top=", pi->ctl_top);
@@ -280,5 +361,10 @@ void panel_report_short(const struct panel_info *pi)
 
 void panel_dump(void)
 {
+}
+
+uint64_t smmu_dump(void)
+{
+	return 0;
 }
 #endif
