@@ -24,6 +24,8 @@ int panel_to_xrgb(struct panel_info *pi);
 void panel_report(const struct panel_info *pi);
 /* Read-only dump of MDSS/MDP top, CTLs, PPs, SSPPs, layer mixers, DSI0. */
 void panel_dump(void);
+/* MDP interrupt status, PP0 counters and DSI0 FIFO status, n samples ms apart. */
+void panel_sample(int n, unsigned ms);
 /*
  * apps SMMU (0x15000000): stream-match entries for the MDP (SID 0x880 /
  * 0xc80, mask 0x8), their context banks, and the page walk of the splash

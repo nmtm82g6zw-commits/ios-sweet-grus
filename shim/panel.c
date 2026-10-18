@@ -248,6 +248,26 @@ static uint64_t smmu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova)
 	return 0;
 }
 
+static void spin_ms(unsigned ms)
+{
+	uint64_t f, t0, t;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+	do
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	while (t - t0 < f / 1000 * ms);
+}
+
+void panel_sample(int n, unsigned ms)
+{
+	for (int i = 0; i < n; i++) {
+		con_hex2("SAMPLE", "intr=", rd32(MDP_BASE + 0x1014), "ppline=", rd32(PP(0) + 0x2c));
+		con_hex2("", "ppcnt=", rd32(PP(0) + 0x14), "dsififo=", rd32(0x0ae94000UL + 0xc));
+		if (i + 1 < n)
+			spin_ms(ms);
+	}
+}
+
 uint64_t smmu_dump(void)
 {
 	uint32_t idr0 = rd32(SMMU_BASE + 0x20), idr1 = rd32(SMMU_BASE + 0x24);
@@ -366,5 +386,11 @@ void panel_dump(void)
 uint64_t smmu_dump(void)
 {
 	return 0;
+}
+
+void panel_sample(int n, unsigned ms)
+{
+	(void)n;
+	(void)ms;
 }
 #endif

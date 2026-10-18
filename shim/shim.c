@@ -401,12 +401,29 @@ void shim_main(uint64_t dtb)
 	 * are dumped first exactly as ABL left them, then after panel_init.
 	 */
 	if (BOARD_CMD_PANEL && !loader_has_payload(dtb)) {
-		static const int bpp[3] = {4, 3, 2};
-		const uintptr_t win = ((uintptr_t)FB_W * 3 * FB_H / 3) & ~7UL;
 		int u;
 		stage = "diag";
+		/* Splash bytes BEFORE anything is drawn: is ABL's screen in there? */
+		static const uint32_t fx[6] = {540, 540, 540, 100, 980, 540};
+		static const uint32_t fy[6] = {1170, 600, 1800, 1170, 1170, 100};
+		uint32_t fpix[6], fnz = 0;
+		for (int i = 0; i < 6; i++)
+			fpix[i] = *(volatile uint32_t *)(FB_PHYS + (uintptr_t)fy[i] * FB_STRIDE + fx[i] * 4);
+		for (uintptr_t a = FB_PHYS; a < FB_PHYS + (uintptr_t)FB_STRIDE * FB_H; a += 4 * 97)
+			fnz += *(volatile uint32_t *)a != 0;
+		/* Does a CPU write land in the splash buffer? (MMU off: Device accesses) */
+		volatile uint32_t *probe = (volatile uint32_t *)(FB_PHYS + (uintptr_t)FB_STRIDE * (FB_H - 1));
+		uint32_t pold = probe[0];
+		probe[0] = 0xa5c3e1f0;
+		__asm__ volatile("dsb sy" ::: "memory");
+		uint32_t pnew = probe[0];
+		probe[0] = pold;
 		con_set_format(4, FB_STRIDE);
-		con_str("DIAG", "grus shim diag v6");
+		con_str("DIAG", "grus shim diag v7");
+		for (int i = 0; i < 6; i++)
+			con_hex2("FBPIX", "xy=", fx[i] << 16 | fy[i], "v=", fpix[i]);
+		con_hex2("FBNZ", "nonzero=", fnz, "of=", (uint32_t)(FB_STRIDE * FB_H / (4 * 97)));
+		con_hex2("FBWR", "wrote=", 0xa5c3e1f0, "read=", pnew);
 		con_hex2("CPU", "el=", (uint32_t)(rsr("CurrentEL") >> 2), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 		con_hex2("DTB", "at=", (uint32_t)dtb, "hi=", (uint32_t)(dtb >> 32));
 		show_memory(dtb);
@@ -431,12 +448,21 @@ void shim_main(uint64_t dtb)
 		panel_dump();
 		ufs_save_log("4-after-panel-init");
 		stage = "draw";
-		for (int k = 0; k < 3; k++) {
-			con_set_window(bpp[k], (uint32_t)FB_W * bpp[k], k * win, win);
-			con_hex2("FORMAT", "bpp=", (uint32_t)bpp[k], "stride=", (uint32_t)FB_W * bpp[k]);
-			panel_report_short(&pi);
+		con_str("STAGE", "samples before drawing");
+		panel_sample(4, 250);
+		/* Three full-width bands, ARGB8888 (the SSPP0 format): red, green, blue. */
+		for (int y = 0; y < FB_H; y++) {
+			uint32_t c = y < FB_H / 3 ? 0xffff0000U : y < 2 * FB_H / 3 ? 0xff00ff00U : 0xff0000ffU;
+			volatile uint32_t *line = (volatile uint32_t *)(FB_PHYS + (uintptr_t)y * FB_STRIDE);
+			for (int x = 0; x < FB_W; x++)
+				line[x] = c;
 		}
-		con_str("STAGE", "drawn; waiting 60 s");
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("BANDS", "top=", *(volatile uint32_t *)(FB_PHYS + 100 * FB_STRIDE + 2000),
+			 "bot=", *(volatile uint32_t *)(FB_PHYS + 2200UL * FB_STRIDE + 2000));
+		con_str("STAGE", "bands drawn (red/green/blue); samples");
+		panel_sample(4, 250);
+		con_str("STAGE", "waiting 60 s");
 		ufs_save_log("5-drawn");
 		delay_ms(60000);
 		con_str("STAGE", "done, reset");
