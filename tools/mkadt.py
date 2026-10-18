@@ -36,13 +36,14 @@ BOARDS = {
         cpu_compat=b'qcom,kryo470', cpu_hz=(1804800000, 2304000000),  # A55, A76
         high_mem=(0x100000000, 0xfcc00000)),
     # grus: SoC carries 'xiaomi,sweet' too, which SweetPlatformExpert matches.
-    # Default high RAM is a conservative 3 GiB of the 6 GiB part's upper bank
-    # until the live /memory node is known (shim MEMORY lines, then --mem).
+    # High RAM: the whole upper bank of a 6 GiB grus, measured from the live
+    # FDT (2026-10-18): /memory <0x1_00000000 0xfd6c0000>, no static carve-out
+    # in it (tools/fdt-ram.py). Other variants: pass --mem.
     'grus': dict(
         fb=(0x9c000000, 0x2300000), fb_w=1080, fb_h=2340,
         compat=[b'xiaomi,grus', b'xiaomi,sweet', b'qcom,sdm670'],
         cpu_compat=b'qcom,kryo360', cpu_hz=(1708800000, 2304000000),  # A55, A75 (SDM712)
-        high_mem=(0x100000000, 0xc0000000)),
+        high_mem=(0x100000000, 0xfd6c0000)),
 }
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
