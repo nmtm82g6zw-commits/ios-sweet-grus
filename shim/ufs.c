@@ -31,6 +31,14 @@
 
 #define BLOCK		4096u
 
+/* Own compare: clang turns __builtin_strcmp into a libc call, and there is no libc. */
+static int name_is(const char *a, const char *b)
+{
+	while (*a && *a == *b)
+		a++, b++;
+	return *a == *b;
+}
+
 static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
 static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS_BASE + off) = v; }
 
@@ -185,8 +193,7 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
-		if (!__builtin_strcmp(name, "userdata") || !__builtin_strcmp(name, "cust") ||
-		    !__builtin_strcmp(name, "cache"))
+		if (name_is(name, "userdata") || name_is(name, "cust") || name_is(name, "cache"))
 			con_str(" fs", fs_type((uint32_t)first));
 	}
 }

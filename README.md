@@ -97,7 +97,7 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 
 ### 3. Build the boot image
 
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
+Needs `aarch64-linux-gnu-gcc` (or `clang` + `ld.lld`, e.g. `brew install llvm lld` on macOS) and Python 3; the boot image is written by `tools/mkbootimg.py`, so no Android `mkbootimg` package is needed.
 
 ```sh
 python3 tools/mkadt.py shim/out/sweet.adt --highmem

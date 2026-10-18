@@ -54,6 +54,12 @@ gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel-grus -D xnu/out-grus
 `board=grus` sets `SWEET_BOARD_FLAGS=-DSWEET_BOARD_GRUS=1`, which patch 0079 adds
 to `MACHINE_FLAGS_ARM64_SWEET`. `out/BOARD` in the artifact records it.
 
+Host tools: `aarch64-linux-gnu-gcc` or `clang` + `ld.lld` (macOS:
+`brew install llvm lld` and put `$(brew --prefix llvm)/bin` first in `PATH`),
+Python 3, gzip. `shim/build.sh` writes the boot image with `tools/mkbootimg.py`
+(byte-identical to AOSP mkbootimg for header v1/v2, no `gki` module needed)
+and needs neither gawk, cpio nor GNU truncate.
+
 Stock DTBs (ABL picks one by msm-id/board-id/pmic-id, so carry all of them):
 
 ```sh
