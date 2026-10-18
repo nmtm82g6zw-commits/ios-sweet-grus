@@ -1,9 +1,11 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot.img like the stock one:
 #   BOARD=sweet (default): header v2 with the stock dtb section (PixelOS header)
-#   BOARD=grus:            header v1, Image.gz with the stock DTBs appended
-#                          (Mi 9 SE stock layout; ../dtb/grus/dtb, see
-#                          tools/split-appended-dtb.py; DTB=... overrides)
+#   BOARD=grus:            same header version as the phone's stock boot.img
+#                          (../dtb/grus/header_version, written by
+#                          tools/grus-stock-dtb.py; GRUS_HEADER=1|2 overrides):
+#                          v2 = dtb section (like sweet), v1 = Image.gz + DTBs
+#                          appended. DTBs from ../dtb/grus/dtb (DTB=... overrides)
 set -euo pipefail
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
@@ -15,7 +17,9 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-on
 # (clang + ld.lld, e.g. Homebrew llvm + lld on macOS) when no GNU cross gcc.
 CROSS=${CROSS:-aarch64-linux-gnu-}
 if command -v "${CROSS}gcc" >/dev/null 2>&1; then
-	CC="${CROSS}gcc"; LDFLAGS_X="-Wl,--no-warn-rwx-segments"
+	CC="${CROSS}gcc"; LDFLAGS_X=""
+	# binutils >= 2.39 warns about the RWX segment (-N); older ld lacks the flag.
+	"${CROSS}ld" --help 2>/dev/null | grep -q -- --no-warn-rwx-segments && LDFLAGS_X="-Wl,--no-warn-rwx-segments"
 	OBJCOPY="${CROSS}objcopy"; READELF="${CROSS}readelf"; NM="${CROSS}nm"
 elif command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
 	CC="clang --target=aarch64-none-elf"; LDFLAGS_X="-fuse-ld=lld"
@@ -73,7 +77,13 @@ open(sys.argv[1], 'wb').write(gzip.compress(rec, 9, mtime=0))
 CPIO
 fi
 [ -s "$DTB" ] || { echo "error: stock DTB $DTB missing (see README, porting to grus)" >&2; exit 1; }
+HDR=2
 if [ "$BOARD" = grus ]; then
+	HDR=${GRUS_HEADER:-$(cat ../dtb/grus/header_version 2>/dev/null || echo 2)}
+	case "$HDR" in 1|2) ;; *) echo "error: GRUS_HEADER=$HDR (1 or 2)" >&2; exit 1 ;; esac
+	echo "grus: boot image header v$HDR"
+fi
+if [ "$HDR" = 1 ]; then
 	# ABL (header v1) finds the DTBs after the gzip stream, as in the stock
 	# Image.gz-dtb; it decompresses the padded Image, so .bss/stacks exist.
 	gzip -9 -n -c out/Image > out/Image.gz
