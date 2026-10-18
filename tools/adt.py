@@ -36,9 +36,33 @@ def im4p_payload(buf):
             'encrypted': any(t == 0x04 for t, _ in items[4:])}
     payload = items[3][1]
     if payload[:4] == b'bvx2':
-        payload = subprocess.run(['lzfse', '-decode'], input=payload,
-                                 capture_output=True, check=True).stdout
+        payload = lzfse_decode(payload)
     return payload, info
+
+
+def lzfse_decode(data):
+    """lzfse CLI if installed, else macOS libcompression (no extra tools)."""
+    import shutil
+    if shutil.which('lzfse'):
+        return subprocess.run(['lzfse', '-decode'], input=data,
+                              capture_output=True, check=True).stdout
+    import ctypes, ctypes.util
+    lib = ctypes.util.find_library('compression')
+    if not lib:
+        raise SystemExit('LZFSE payload: install lzfse (brew install lzfse) or run on macOS')
+    cl = ctypes.CDLL(lib)
+    cl.compression_decode_buffer.restype = ctypes.c_size_t
+    cl.compression_decode_buffer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                             ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    size = len(data) * 8
+    while True:
+        out = ctypes.create_string_buffer(size)
+        n = cl.compression_decode_buffer(out, size, data, len(data), None, 0x801)  # COMPRESSION_LZFSE
+        if n == 0:
+            raise SystemExit('LZFSE decode failed')
+        if n < size:
+            return out.raw[:n]
+        size *= 4
 
 
 def load(path):
