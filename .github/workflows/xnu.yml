@@ -19,7 +19,7 @@ on:
         description: sweet (Redmi Note 10 Pro) or grus (Mi 9 SE); same SWEET config, board constants differ
         default: sweet
   push:
-    branches: [main]
+    branches: [main, grus-port]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -34,9 +34,10 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  SWEET_BOARD: ${{ inputs.board || 'sweet' }}
+  # Board: the dispatch input, else grus for pushes to the grus-port branch.
+  SWEET_BOARD: ${{ inputs.board || (github.ref_name == 'grus-port' && 'grus') || 'sweet' }}
   # Read by makedefs/MakeInc.def (patch 0079) for MACHINE_FLAGS_ARM64_SWEET.
-  SWEET_BOARD_FLAGS: ${{ inputs.board == 'grus' && '-DSWEET_BOARD_GRUS=1' || '' }}
+  SWEET_BOARD_FLAGS: ${{ (inputs.board == 'grus' || (!inputs.board && github.ref_name == 'grus-port')) && '-DSWEET_BOARD_GRUS=1' || '' }}
 
 jobs:
   build:
@@ -126,6 +127,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ inputs.board == 'grus' && 'xnu-kernel-grus' || 'xnu-kernel' }}
+          name: ${{ (inputs.board == 'grus' || (!inputs.board && github.ref_name == 'grus-port')) && 'xnu-kernel-grus' || 'xnu-kernel' }}
           path: out/
           if-no-files-found: warn
