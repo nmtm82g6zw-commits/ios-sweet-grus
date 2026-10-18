@@ -170,6 +170,53 @@ int panel_to_xrgb(struct panel_info *pi)
 	return 0;
 }
 
+static void dump_block(const char *label, uintptr_t base, uint32_t first, uint32_t count)
+{
+	for (uint32_t i = 0; i < count; i += 2) {
+		char a[] = "+000=", b[] = "+000=";
+		static const char hx[] = "0123456789ABCDEF";
+		uint32_t o0 = first + 4 * i, o1 = o0 + 4;
+		a[1] = hx[(o0 >> 8) & 15]; a[2] = hx[(o0 >> 4) & 15]; a[3] = hx[o0 & 15];
+		b[1] = hx[(o1 >> 8) & 15]; b[2] = hx[(o1 >> 4) & 15]; b[3] = hx[o1 & 15];
+		con_hex2(label, a, rd32(base + o0), i + 1 < count ? b : 0, i + 1 < count ? rd32(base + o1) : 0);
+	}
+}
+
+void panel_dump(void)
+{
+	con_hex2("MDSS", "hwver=", rd32(MDP_BASE + 0x0), "irq=", rd32(MDP_BASE + 0x10));
+	dump_block("TOP", MDP_BASE + 0x1000, 0, 16);		/* sde-off 0x1000 */
+	for (int n = 0; n < N_CTL; n++) {
+		char l[] = "CTL0";
+		l[3] = '0' + n;
+		dump_block(l, CTL(n), 0, 12);
+	}
+	for (int n = 0; n < N_PP; n++) {
+		char l[] = "PP0";
+		l[2] = '0' + n;
+		dump_block(l, PP(n), 0, 16);
+	}
+	for (int i = 0; i < N_SSPP; i++) {
+		char l[] = "SSPP0";
+		l[4] = '0' + i;
+		dump_block(l, sspp_base(i), 0, 16);		/* size, xy, out, addr, stride, fmt, unpack */
+	}
+	for (int n = 0; n < 2; n++) {
+		char l[] = "LM0";
+		l[2] = '0' + n;
+		dump_block(l, MDP_BASE + 0x45000 + 0x1000 * n, 0, 8);
+	}
+	for (int n = 0; n < 4; n++) {
+		char l[] = "INTF0";
+		l[4] = '0' + n;
+		dump_block(l, MDP_BASE + 0x6b000 + 0x800 * n, 0, 4);
+	}
+	dump_block("DSI0", 0x0ae94000UL, 0, 16);
+	/* What ABL left in the splash buffer: first 32 bytes and the middle row. */
+	dump_block("FB", FB_PHYS, 0, 8);
+	dump_block("FBmid", FB_PHYS + (uintptr_t)FB_W * 3 * (FB_H / 2), 0, 8);
+}
+
 void panel_report_short(const struct panel_info *pi)
 {
 	con_hex2("CTL", "n=", (uint32_t)pi->ctl, "top=", pi->ctl_top);
@@ -229,5 +276,9 @@ void panel_report(const struct panel_info *pi)
 void panel_report_short(const struct panel_info *pi)
 {
 	(void)pi;
+}
+
+void panel_dump(void)
+{
 }
 #endif

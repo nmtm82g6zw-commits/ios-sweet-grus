@@ -18,6 +18,11 @@ void con_set_format(int bytes_per_pixel, uint32_t stride);
 void con_color_bars(void);
 void con_set_window(int bytes_per_pixel, uint32_t stride, uintptr_t base, uintptr_t size);
 
+/* Everything printed is also kept as plain text (for shim/ufs.c to save). */
+extern char con_log[];
+extern uint32_t con_log_len;
+#define CON_LOG_MAX	(60 * 1024)
+
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);

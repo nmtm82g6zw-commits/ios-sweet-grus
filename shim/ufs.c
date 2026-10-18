@@ -4,8 +4,11 @@
  * Runs with the MMU off (all memory Device, so DMA is coherent with no cache
  * maintenance). Dumps the UFSHCI registers ABL left behind and, if the host
  * is enabled and the link is up, points the transfer request list at our own
- * buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
- * written to the device: there is no SCSI WRITE in this file.
+ * buffers and issues SCSI commands on LUN 0. The only write is
+ * ufs_save_log(): WRITE(10) of at most DIAG_BLOCKS blocks at the start of
+ * the GPT partition named exactly "logdump" (an unused crash-dump area;
+ * the grus run scripts back it up first), bounds-checked against the
+ * partition. Nothing else is ever written.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
  */
@@ -90,8 +93,8 @@ static uint32_t be32(const uint8_t *p)
  * Issue one SCSI command (read direction or no data) in slot 0.
  * Returns 0 on success, otherwise a code describing the failure stage.
  */
-static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
-    uint32_t *ocs_out, uint32_t *status_out)
+static uint32_t scsi_dir(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
+    int write, uint32_t *ocs_out, uint32_t *status_out)
 {
 	static uint8_t tag;
 	zero(&utrl[0], sizeof(utrl[0]));
@@ -99,7 +102,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 
 	/* Command UPIU: header (12 bytes), expected length, CDB. */
 	ucd.cmd[0] = 0x01;			/* transaction type: COMMAND */
-	ucd.cmd[1] = len ? 0x40 : 0x00;		/* flags: R (data in) */
+	ucd.cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;	/* flags: W (data out) / R (data in) */
 	ucd.cmd[2] = lun;
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
@@ -110,7 +113,8 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		ucd.cmd[16 + i] = cdb[i];
 
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
-	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
+	/* UFS storage; data direction 1 = host->device, 2 = device->host */
+	utrl[0].dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
@@ -140,6 +144,12 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
 		return 3;
 	return *status_out ? 4 : 0;
+}
+
+static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
+    uint32_t *ocs_out, uint32_t *status_out)
+{
+	return scsi_dir(lun, cdb, cdb_len, buf, len, 0, ocs_out, status_out);
 }
 
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
@@ -269,4 +279,104 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+}
+
+/* ---------------- diagnostic log in "logdump" ---------------- */
+
+#define DIAG_BLOCKS	16u	/* 64 KiB */
+
+static int ufs_ready;		/* host taken over, LUN 0 answers */
+static uint32_t diag_lba;	/* first block of "logdump", 0 = not found */
+static uint32_t diag_blocks;
+
+/* Take over the transfer list and find "logdump". Returns 0 when ready. */
+int ufs_diag_open(void)
+{
+	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE), ocs, st;
+
+	if (ufs_ready)
+		return 0;
+	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR))
+		return 1;
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1))
+		return 2;
+	static const uint8_t tur[6] = { 0x00 };
+	for (int i = 0; i < 3 && scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st); i++)
+		;
+	if (read_blocks(1, 1, data))
+		return 3;
+	const uint8_t *gpt = data;
+	if (gpt[0] != 'E' || gpt[1] != 'F' || gpt[2] != 'I' || gpt[3] != ' ')
+		return 4;
+	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
+	uint32_t elba = gpt[72] | gpt[73] << 8;
+	if (esz != 128 || nent > 128)
+		return 5;
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	if (read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+		return 6;
+	int found = 0;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		char name[17];
+		for (int c = 0; c < 16; c++)
+			name[c] = (char)e[56 + 2 * c];
+		name[16] = 0;
+		if (!name_is(name, "logdump"))
+			continue;
+		uint64_t first = le64(e + 32), last = le64(e + 40);
+		if (!first || last < first || last >= 0xffffffffULL)
+			return 7;
+		diag_lba = (uint32_t)first;
+		diag_blocks = (uint32_t)(last - first + 1);
+		found++;
+	}
+	if (found != 1 || diag_blocks < DIAG_BLOCKS)
+		return 8;
+	ufs_ready = 1;
+	return 0;
+}
+
+/*
+ * Write the console text log to the start of "logdump": a 64-byte header
+ * ("SWEETDIAG1", stage, length) followed by the text, zero padded to
+ * DIAG_BLOCKS blocks. Returns 0 on success.
+ */
+int ufs_save_log(const char *stage)
+{
+	static uint8_t buf[DIAG_BLOCKS * BLOCK] __attribute__((aligned(4096)));
+	uint32_t ocs, st;
+
+	if (!ufs_ready || !diag_lba || diag_blocks < DIAG_BLOCKS)
+		return 1;
+	zero(buf, sizeof(buf));
+	static const char magic[] = "SWEETDIAG1";
+	for (unsigned i = 0; i < sizeof(magic) - 1; i++)
+		buf[i] = (uint8_t)magic[i];
+	for (unsigned i = 0; i < 32 && stage[i]; i++)
+		buf[16 + i] = (uint8_t)stage[i];
+	uint32_t n = con_log_len < sizeof(buf) - 64 ? con_log_len : sizeof(buf) - 64;
+	buf[48] = (uint8_t)n; buf[49] = (uint8_t)(n >> 8); buf[50] = (uint8_t)(n >> 16);
+	for (uint32_t i = 0; i < n; i++)
+		buf[64 + i] = (uint8_t)con_log[i];
+	__asm__ volatile("dsb sy" ::: "memory");
+	uint32_t lba = diag_lba;
+	if (lba + DIAG_BLOCKS > diag_lba + diag_blocks)	/* never outside logdump */
+		return 2;
+	uint8_t cdb[10] = { 0x2a, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, 0, DIAG_BLOCKS, 0 };
+	if (scsi_dir(0, cdb, sizeof(cdb), buf, DIAG_BLOCKS * BLOCK, 1, &ocs, &st))
+		return 3;
+	static const uint8_t sync10[10] = { 0x35 };	/* SYNCHRONIZE CACHE(10), whole LUN */
+	return scsi(0, sync10, sizeof(sync10), 0, 0, &ocs, &st) ? 4 : 0;
+}
+
+uint32_t ufs_diag_lba(void)
+{
+	return diag_lba;
 }

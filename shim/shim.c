@@ -389,27 +389,53 @@ void shim_main(uint64_t dtb)
 
 	/* Command-mode panel (grus): nothing drawn shows up before this. */
 	struct panel_info pi;
-	stage = "panel";
-	panel_init(&pi);
+	if (!(BOARD_CMD_PANEL && !loader_has_payload(dtb))) {
+		stage = "panel";
+		panel_init(&pi);
+	}
 
 	/*
-	 * grus bring-up: the splash format is unknown (fine stripes on the
-	 * first boots). Without a payload, draw the same short report in three
-	 * windows of the splash, each laid out for one geometry, in white and
-	 * black only: the readable one names the real format.
+	 * grus bring-up without a payload: the panel does not show what we draw,
+	 * so the report goes to the "logdump" partition (shim/ufs.c), saved
+	 * after every stage; tools read it back from recovery. MDP registers
+	 * are dumped first exactly as ABL left them, then after panel_init.
 	 */
 	if (BOARD_CMD_PANEL && !loader_has_payload(dtb)) {
 		static const int bpp[3] = {4, 3, 2};
 		const uintptr_t win = ((uintptr_t)FB_W * 3 * FB_H / 3) & ~7UL;
+		int u;
 		stage = "diag";
+		con_set_format(4, FB_STRIDE);
+		con_str("DIAG", "grus shim diag v5");
+		con_hex2("CPU", "el=", (uint32_t)(rsr("CurrentEL") >> 2), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+		con_hex2("DTB", "at=", (uint32_t)dtb, "hi=", (uint32_t)(dtb >> 32));
+		show_memory(dtb);
+		u = ufs_diag_open();
+		con_hex2("UFS", "open=", (uint32_t)u, "logdump=", ufs_diag_lba());
+		ufs_save_log("1-start");
+		stage = "mdp read";
+		con_str("STAGE", "MDP as ABL left it");
+		ufs_save_log("2-before-mdp-read");
+		panel_dump();
+		ufs_save_log("3-mdp-read");
+		stage = "panel_init";
+		panel_init(&pi);
+		con_str("STAGE", "after panel_init");
+		panel_report_short(&pi);
+		panel_dump();
+		ufs_save_log("4-after-panel-init");
+		stage = "draw";
 		for (int k = 0; k < 3; k++) {
 			con_set_window(bpp[k], (uint32_t)FB_W * bpp[k], k * win, win);
 			con_hex2("FORMAT", "bpp=", (uint32_t)bpp[k], "stride=", (uint32_t)FB_W * bpp[k]);
 			panel_report_short(&pi);
-			show_memory(dtb);
 		}
-		delay_ms(150000);
-		reset(20);
+		con_str("STAGE", "drawn; waiting 60 s");
+		ufs_save_log("5-drawn");
+		delay_ms(60000);
+		con_str("STAGE", "done, reset");
+		ufs_save_log("6-done");
+		reset(5);
 	}
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */

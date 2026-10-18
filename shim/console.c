@@ -98,10 +98,31 @@ static void put_char(int col, char ch, uint32_t fg)
 		}
 }
 
+char con_log[CON_LOG_MAX];
+uint32_t con_log_len;
+static int log_at_bol = 1;
+
+static void log_ch(char c)
+{
+	if (con_log_len < CON_LOG_MAX - 1)
+		con_log[con_log_len++] = c;
+}
+
+static void log_nl(void)
+{
+	log_ch('\n');
+	log_at_bol = 1;
+}
+
 static int put_str(int col, const char *s, uint32_t fg)
 {
-	while (*s)
+	if (!log_at_bol)
+		log_ch(' ');
+	log_at_bol = 0;
+	while (*s) {
+		log_ch(*s);
 		put_char(col++, *s++, fg);
+	}
 	return col;
 }
 
@@ -124,11 +145,13 @@ void con_color_bars(void)
 				put_px(x, y, c);
 	}
 	put_str(0, "RGB", YELLOW);
+	log_nl();
 	row += 2;
 }
 
 void con_skip(void)
 {
+	log_nl();
 	row++;
 }
 
@@ -136,6 +159,7 @@ void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
+	log_nl();
 	row++;
 }
 
@@ -159,5 +183,6 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
 	}
+	log_nl();
 	row++;
 }
