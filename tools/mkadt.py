@@ -42,7 +42,10 @@ BOARDS = {
     'grus': dict(
         fb=(0x9c000000, 0x2300000), fb_w=1080, fb_h=2340,
         compat=[b'xiaomi,grus', b'xiaomi,sweet', b'qcom,sdm670'],
-        cpu_compat=b'qcom,kryo360', cpu_hz=(1708800000, 2304000000),  # A55, A75 (SDM712)
+        # 'qcom,kryo470' is the IONameMatch key of SweetCPU (iokit/KernelConfigTables.cpp):
+        # without it no CPU registers and the kernel waits forever in
+        # ml_wait_max_cpus() right after IOKit (grus boot k2, 2026-10-18).
+        cpu_compat=b'qcom,kryo360\0qcom,kryo470', cpu_hz=(1708800000, 2304000000),  # A55, A75 (SDM712)
         high_mem=(0x100000000, 0xfd6c0000)),
 }
 
