@@ -11,13 +11,12 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "board.h"
+#include "fdt.h"
+#include "panel.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
-
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
+/* IMEM_RESTART_REASON, PSHOLD, GICD_BASE, GICR_BASE: board.h */
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -347,6 +346,20 @@ static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
 	con_hex2(label, "feat=", smc(PSCI_FEATURES, fn, 0, 0), 0, 0);
 }
 
+/* /memory banks, in 4K pages so they fit the 32-bit hex fields. */
+static void show_memory(uint64_t dtb)
+{
+	uint64_t base[8], size[8];
+	int n = fdt_memory_banks(dtb, base, size, 8);
+
+	if (n < 0) {
+		con_str("MEMORY", "FDT /memory not understood");
+		return;
+	}
+	for (int i = 0; i < n && i < 8; i++)
+		con_hex2("MEMORY", "page=", base[i] >> 12, "pages=", size[i] >> 12);
+}
+
 static uint64_t scratch[8192];	/* 64KB, lives in our (later cacheable) image */
 
 static uint64_t ticks_fill(uint32_t c)
@@ -374,10 +387,19 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+	/* Command-mode panel (grus): nothing drawn shows up before this. */
+	struct panel_info pi;
+	stage = "panel";
+	panel_init(&pi);
+
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", "milestone 4: xnu loader");
+	con_str("BOARD", BOARD_NAME);
+	if (BOARD_CMD_PANEL)
+		panel_report(&pi);
+	show_memory(dtb);
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

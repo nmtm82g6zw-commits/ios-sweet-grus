@@ -100,6 +100,23 @@ const char *loader_boot(uintptr_t dtb)
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
 
+	/* The RAM in the ADT was chosen on the host (mkadt.py --mem): make sure
+	 * this phone has it and no carve-out sits in it before writing to it. */
+	uint64_t hit_base = 0, hit_size = 0;
+	switch (fdt_ram_check(dtb, p->phys_base, p->mem_size, &hit_base, &hit_size)) {
+	case 0:
+		con_str("RAM", "inside /memory, no carve-out");
+		break;
+	case 1:
+		return "kernel RAM not in /memory (mkadt --mem)";
+	case 2:
+		con_hex2("CARVEOUT", "base=", hit_base >> 12, "size=", hit_size >> 12);
+		return "kernel RAM overlaps reserved-memory";
+	default:
+		con_str("RAM", "FDT not understood, not checked");
+		break;
+	}
+
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;

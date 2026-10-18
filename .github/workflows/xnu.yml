@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      board:
+        description: sweet (Redmi Note 10 Pro) or grus (Mi 9 SE); same SWEET config, board constants differ
+        default: sweet
   push:
     branches: [main]
     paths:
@@ -31,6 +34,9 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  SWEET_BOARD: ${{ inputs.board || 'sweet' }}
+  # Read by makedefs/MakeInc.def (patch 0079) for MACHINE_FLAGS_ARM64_SWEET.
+  SWEET_BOARD_FLAGS: ${{ inputs.board == 'grus' && '-DSWEET_BOARD_GRUS=1' || '' }}
 
 jobs:
   build:
@@ -113,12 +119,13 @@ jobs:
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          echo "board=$SWEET_BOARD flags=$SWEET_BOARD_FLAGS" > out/BOARD
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: ${{ inputs.board == 'grus' && 'xnu-kernel-grus' || 'xnu-kernel' }}
           path: out/
           if-no-files-found: warn

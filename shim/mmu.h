@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0x9c000000UL
+#include "board.h"	/* FB_PHYS */
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;

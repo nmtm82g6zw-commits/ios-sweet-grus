@@ -142,6 +142,13 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 
 `tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
 
+## Other phones
+
+[`PORTING-GRUS.md`](PORTING-GRUS.md): port to the Xiaomi Mi 9 SE (`grus`, SDM712).
+Same kernel config with board constants selected at build time
+(`gh workflow run xnu.yml -f board=grus`, `BOARD=grus shim/build.sh`,
+`mkadt.py --board grus`). Written from Xiaomi's kernel sources, not yet booted.
+
 ## Repository layout
 
 | Path | What |
