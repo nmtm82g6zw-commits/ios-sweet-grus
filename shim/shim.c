@@ -392,6 +392,26 @@ void shim_main(uint64_t dtb)
 	stage = "panel";
 	panel_init(&pi);
 
+	/*
+	 * grus bring-up: the splash format is unknown (fine stripes on the
+	 * first boots). Without a payload, draw the same short report in three
+	 * windows of the splash, each laid out for one geometry, in white and
+	 * black only: the readable one names the real format.
+	 */
+	if (BOARD_CMD_PANEL && !loader_has_payload(dtb)) {
+		static const int bpp[3] = {4, 3, 2};
+		const uintptr_t win = ((uintptr_t)FB_W * 3 * FB_H / 3) & ~7UL;
+		stage = "diag";
+		for (int k = 0; k < 3; k++) {
+			con_set_window(bpp[k], (uint32_t)FB_W * bpp[k], k * win, win);
+			con_hex2("FORMAT", "bpp=", (uint32_t)bpp[k], "stride=", (uint32_t)FB_W * bpp[k]);
+			panel_report_short(&pi);
+			show_memory(dtb);
+		}
+		delay_ms(150000);
+		reset(20);
+	}
+
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);

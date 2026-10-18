@@ -6,8 +6,9 @@
 #include "font.h"
 
 #define SCALE		3
-#define CH_W		(8 * SCALE)
-#define CH_H		(16 * SCALE)
+static int con_scale = SCALE;
+#define CH_W		(8 * con_scale)
+#define CH_H		(16 * con_scale)
 #define MARGIN		24
 #define LABEL_COLS	8
 
@@ -16,16 +17,50 @@ static uint32_t con_bg;
 static int row;
 static int con_bpp;		/* 0 = not set: 4 */
 static uint32_t con_stride;
+static uintptr_t con_base;	/* byte offset of the drawing window in the splash */
+static int con_rows = FB_H;	/* rows in the window */
+static int con_mono;		/* 1: pixels are all-0x00 or all-0xff bytes */
 
 void con_set_format(int bytes_per_pixel, uint32_t stride)
 {
 	con_bpp = bytes_per_pixel == 3 ? 3 : 4;
 	con_stride = stride ? stride : (uint32_t)FB_W * con_bpp;
+	con_base = 0;
+	con_rows = FB_H;
+	con_mono = 0;
+	con_scale = SCALE;
+}
+
+/*
+ * Format-independent drawing: white = all bytes 0xff, black = all 0x00 look
+ * the same in 16, 24 or 32 bpp, so only the geometry (bytes per pixel,
+ * stride) decides whether the text in this window is readable.
+ */
+void con_set_window(int bytes_per_pixel, uint32_t stride, uintptr_t base, uintptr_t size)
+{
+	con_bpp = bytes_per_pixel;
+	con_stride = stride;
+	con_base = base;
+	con_rows = (int)(size / stride);
+	con_mono = 1;
+	con_scale = 2;
+	con_bg = 0;
+	row = 0;
+	for (uintptr_t a = FB_BASE + base; a < FB_BASE + base + size; a += 8)
+		*(volatile uint64_t *)a = 0;
 }
 
 /* One pixel; c is 0xAARRGGBB, stored B,G,R(,A) like the splash formats. */
 static inline void put_px(int x, int y, uint32_t c)
 {
+	if (con_mono) {
+		uint8_t v = c ? 0xff : 0x00;
+		volatile uint8_t *p = (volatile uint8_t *)FB_BASE + con_base + (uintptr_t)y * con_stride
+				      + (uintptr_t)x * con_bpp;
+		for (int i = 0; i < con_bpp; i++)
+			p[i] = v;
+		return;
+	}
 	if (con_bpp == 3) {
 		volatile uint8_t *p = (volatile uint8_t *)FB_BASE + (uintptr_t)y * con_stride + (uintptr_t)x * 3;
 		p[0] = (uint8_t)c;
@@ -52,14 +87,14 @@ static void put_char(int col, char ch, uint32_t fg)
 		ch = '?';
 	const unsigned char *g = font8x16[ch - 0x20];
 	int x0 = MARGIN + col * CH_W, y0 = MARGIN + row * CH_H;
-	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
+	if (x0 + CH_W > FB_W || y0 + CH_H > con_rows)
 		return;
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-			for (int sy = 0; sy < SCALE; sy++)
-				for (int sx = 0; sx < SCALE; sx++)
-					put_px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
+			for (int sy = 0; sy < con_scale; sy++)
+				for (int sx = 0; sx < con_scale; sx++)
+					put_px(x0 + gx * con_scale + sx, y0 + gy * con_scale + sy, c);
 		}
 }
 

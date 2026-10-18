@@ -170,6 +170,18 @@ int panel_to_xrgb(struct panel_info *pi)
 	return 0;
 }
 
+void panel_report_short(const struct panel_info *pi)
+{
+	con_hex2("CTL", "n=", (uint32_t)pi->ctl, "top=", pi->ctl_top);
+	con_hex2("PP", "n=", (uint32_t)pi->pp, "ar=", pi->pp_ar_after);
+	for (int i = 0; i < N_SSPP; i++) {
+		char l[] = "P0";
+		l[1] = '0' + i;
+		con_hex2(l, "a=", pi->pipe_addr[i], "f=", pi->pipe_fmt[i]);
+		con_hex2("", "st=", pi->pipe_stride[i], "sz=", rd32(sspp_base(i) + SSPP_SRC_SIZE));
+	}
+}
+
 void panel_report(const struct panel_info *pi)
 {
 	con_hex2("PANEL", "ctl=", (uint32_t)pi->ctl, "top=", pi->ctl_top);
@@ -210,6 +222,11 @@ int panel_to_xrgb(struct panel_info *pi)
 }
 
 void panel_report(const struct panel_info *pi)
+{
+	(void)pi;
+}
+
+void panel_report_short(const struct panel_info *pi)
 {
 	(void)pi;
 }

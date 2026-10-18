@@ -76,6 +76,16 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+int loader_has_payload(uintptr_t dtb)
+{
+	uint64_t rd_start, rd_end;
+
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || rd_end < rd_start + 8)
+		return 0;
+	return magic_ok((const char *)rd_start);
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
