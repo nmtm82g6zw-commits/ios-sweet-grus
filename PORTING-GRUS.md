@@ -139,10 +139,33 @@ every stage: MDP/CTL/PP/SSPP/DSI and SMMU registers, splash contents, RAM.
 `adb exec-out dd if=/dev/block/bootdevice/by-name/logdump bs=4096 count=16`
 from recovery reads it back (`SWEETDIAG1` header, then text).
 
+### First kernel boots (2026-10-18, CI run 39153408958, read-only)
+
+Kernel `board=grus` + `mkadt.py --board grus --highmem`, cmdline without
+`ufsrw`/`rootrw` and with `sweetlog=0`, so nothing is written:
+
+- k1: XNU runs through IOKit up to `AppleCLCD 1080x2340 stride 4320 at
+  0x9c000000, presented as 1125x2436`, then stops.
+- k2 (`io=0x6`): no `SweetCPU` ever probes: its personality is
+  `IONameMatch 'qcom,kryo470'` and the grus ADT said `qcom,kryo360`, so BSD
+  init waits forever in `ml_wait_max_cpus()`. Fixed in `mkadt.py` (grus CPUs
+  carry both names).
+- k3: `SWEET UFS: "userdata" on LUN 0 ... 53063 MiB, read-only`, keys and USB
+  probes, `BSD root: ufsroot0`, `unknown Volume Signature` /
+  `cannot mount root, errno = 19` with retries (expected: userdata still
+  holds Android), skywalk self tests pass. **Touch:** RPMh votes for L13A/L8B
+  complete, GT9886 answers at 0x5d, PID at 0x4535 reads `9886`, coordinate
+  block at 0x4100 reads, `selected GT9886 normandy, 1080x2340`.
+- Open: ~10 s after the touch driver starts polling, the console turns into
+  smeared vertical columns (text still lands in some rows). Not yet known
+  whether it is the console scroll on the 2340-row panel or a side effect of
+  the touch bring-up; irrelevant once the GUI runs with `sweetfb_noconsole=1`,
+  but to be checked (e.g. a boot with `sweettouch=0`).
+
 ## Still unverified
 
-- GT9886 coordinates at `0x4100` (from the vendor tools and test code; the
-  real address is in the vendor `goodix_gt9886_cfg_f2.bin`).
+- GT9886 touch *reports* at `0x4100` (the block reads fine; real touches
+  not yet seen through HID).
 - PMIC GPIO7 of PM660L configured as an input by firmware (the driver checks
   and withholds volume up otherwise; it never reconfigures the PMIC).
 - Everything the kernel does (no grus kernel boot yet).
