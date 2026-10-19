@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..1725d5f 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,9 +88,15 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++#if defined(SWEET_BOARD_GRUS)
++	/* PM660: SMB2 CHGR 0x10, USBIN 0x13, MISC 0x16; FG BATT_SOC 0x40, BATT_INFO 0x41. */
++	bool allowed = peripheral == 0x10 || peripheral == 0x13 || peripheral == 0x16 ||
++	    peripheral == 0x40 || peripheral == 0x41;
++#else
++	bool allowed = peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48;
++#endif
++	if (!sp_ready || !out || sid != 0 || addr > 0xffffu || !allowed) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 93280e5..bc50e7b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -242,6 +242,13 @@ SweetBattery::poll(void)
+ 	    !sweet_spmi_read(0, 0x1006, &gcharger);
+ 	unsigned gmv = gvalid ? (unsigned)(((uint64_t)gvolt * 122070u) / 1000000u) : 0;
+ 	gvalid = gvalid && gmv >= 2800 && gmv <= 4600;
++	static unsigned gdiag;
++	if (fReal && gdiag < 3) {
++		/* First samples only: what the PMIC returned, for bring-up. */
++		gdiag++;
++		IOLog("SWEET BATTERY: grus raw soc %#x/%#x ok=%d vbatt %#x (%u mV) usb %#x path %#x chg %#x valid=%d\n",
++		    soc0, soc1, socValid, gvolt, gmv, gusb, gpath, gcharger, gvalid);
++	}
+ 	if (!gvalid) {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
