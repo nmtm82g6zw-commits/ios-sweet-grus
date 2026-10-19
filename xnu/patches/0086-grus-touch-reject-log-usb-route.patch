@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 529416e..4eadef6 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -483,6 +483,27 @@ touch_gt9886_ack(void)
+ 	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
+ }
+ 
++/*
++ * Bring-up: the first 40 rejected frames are logged with the reason and
++ * their first 20 bytes (grus logs report err=5 continuously).
++ */
++static unsigned gt9886_bad_logged;
++
++static int
++touch_gt9886_bad(const char *why, const uint8_t *b, unsigned len, unsigned extra)
++{
++	if (gt9886_bad_logged < 40) {
++		gt9886_bad_logged++;
++		printf("SWEET TOUCH: gt9886 reject %s (%u) len %u:", why, extra, len);
++		for (unsigned i = 0; i < len && i < 20; ++i) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++	}
++	(void)touch_gt9886_ack();
++	return EIO;
++}
++
+ /* goodix_event_handler + goodix_touch_handler (normandy), polled. */
+ static int
+ touch_gt9886(void)
+@@ -504,8 +525,7 @@ touch_gt9886(void)
+ 	}
+ 	unsigned n = buf[1] & 15u;
+ 	if (n > TOUCH_MAX) {
+-		(void)touch_gt9886_ack();
+-		return EIO;
++		return touch_gt9886_bad("count", buf, first, n);
+ 	}
+ 	if (n > 1) {
+ 		err = touch_read(0x5d, GT9886_COOR_REG + first, true, buf + first,
+@@ -519,8 +539,7 @@ touch_gt9886(void)
+ 		sum = (uint8_t)(sum + buf[i]);
+ 	}
+ 	if (sum != 0) {
+-		(void)touch_gt9886_ack();
+-		return EIO;
++		return touch_gt9886_bad("checksum", buf, n * GT9886_POINT_LEN + GT9886_HEAD_LEN, sum);
+ 	}
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		const uint8_t *p = buf + 2u + i * GT9886_POINT_LEN;
+@@ -532,8 +551,8 @@ touch_gt9886(void)
+ 		unsigned py = (unsigned)p[3] | ((unsigned)p[4] << 8);
+ 		if (id >= TOUCH_MAX || (mask & (1u << id)) ||
+ 		    px > SWEET_PANEL_W - 1u || py > SWEET_PANEL_H - 1u) {
+-			(void)touch_gt9886_ack();
+-			return EIO;
++			return touch_gt9886_bad(id >= TOUCH_MAX || (mask & (1u << id)) ? "id" : "range",
++			    buf, n * GT9886_POINT_LEN + GT9886_HEAD_LEN, px << 16 | py);
+ 		}
+ 		mask |= 1u << id;
+ 		static int orient = -1; /* boot-arg sweettouchorient: bit 0 mirrors x, bit 1 mirrors y; default none */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 5dd94be..f1e50ca 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -34,6 +34,8 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++struct rtentry;
++extern int rtrequest(int, struct sockaddr *, struct sockaddr *, struct sockaddr *, int, struct rtentry **);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -703,6 +705,26 @@ ud_if_create(void)
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++
++	/*
++	 * Default route via the host (192.168.7.1), so the phone can reach the
++	 * internet when the host forwards/NATs ue0 (run/20-usb-internet-mac.sh).
++	 * Boot-arg sweetusbroute=0 skips it. No DNS is configured here.
++	 */
++	int want_route = 1;
++	PE_parse_boot_argn("sweetusbroute", &want_route, sizeof(want_route));
++	if (err == 0 && want_route) {
++		struct sockaddr_in dst, gw, mask;
++		bzero(&dst, sizeof(dst));
++		bzero(&gw, sizeof(gw));
++		bzero(&mask, sizeof(mask));
++		dst.sin_len = gw.sin_len = mask.sin_len = sizeof(struct sockaddr_in);
++		dst.sin_family = gw.sin_family = mask.sin_family = AF_INET;
++		gw.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++		int rerr = rtrequest(1 /* RTM_ADD */, (struct sockaddr *)&dst, (struct sockaddr *)&gw,
++		    (struct sockaddr *)&mask, 0x1 | 0x2 | 0x800 /* RTF_UP|GATEWAY|STATIC */, NULL);
++		printf("SWEET USB: default route via 192.168.7.1 %s (err %d)\n", rerr ? "failed" : "added", rerr);
++	}
+ }
+ 
+ static void
