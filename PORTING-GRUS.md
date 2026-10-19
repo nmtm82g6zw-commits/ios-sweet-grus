@@ -189,3 +189,8 @@ turned into resets: the panic text stays on the screen.
 - Battery (0080 + 0081, `sweetbattery=1`): real percentage and charger
   plug/unplug shown by iOS.
 - Untethered: the shim image flashed to `boot` starts iOS on power-on.
+- USB Ethernet (0085 + `sweetusb=2`): grus ABL leaves the QUSB2 PHY powered
+  down (PWR_CTRL1 0x23); after clearing POWR_DOWN (PLL_STATUS 0x17, core
+  ready) the Mac enumerates `ios-sweet "Sweet iOS (USB Ethernet)"` as a
+  CDC-ECM interface, ping 192.168.7.2 answers in ~2 ms with 0 % loss, and the
+  live kernel log arrives on UDP 5140 (`run/18-usbnet-mac.sh` on macOS).
