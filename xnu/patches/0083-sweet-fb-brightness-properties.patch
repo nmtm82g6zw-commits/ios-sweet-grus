@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 624685c..416b2e4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,6 +44,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
++#include <libkern/c++/OSSerialize.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -199,6 +200,7 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -226,10 +228,49 @@ public:
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	void notify(uint32_t type, const uint64_t *values, uint32_t count);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * Brightness bring-up: CoreBrightness does not use the IOMFB selectors on
++ * this platform (0082 saw none while the slider moved). Log what userland
++ * sets as registry properties on the framebuffer or its user client, at
++ * most 200 lines per boot, and accept it.
++ */
++static uint32_t sweet_fb_prop_lines;
++
++static IOReturn
++sweet_fb_log_properties(const char *where, OSObject *properties)
++{
++	if (sweet_fb_prop_lines < 200) {
++		char pname[32];
++		const char *text = "?";
++		OSSerialize *ser = OSSerialize::withCapacity(512);
++		if (ser != NULL && properties != NULL && properties->serialize(ser)) {
++			text = ser->text();
++		}
++		proc_selfname(pname, sizeof(pname));
++		sweet_fb_prop_lines++;
++		IOLog("SWEET FB: %s setProperties on %s %.360s\n", pname, where, text);
++		OSSafeReleaseNULL(ser);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::setProperties(OSObject *properties)
++{
++	return sweet_fb_log_properties("user client", properties);
++}
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	return sweet_fb_log_properties("AppleCLCD", properties);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
