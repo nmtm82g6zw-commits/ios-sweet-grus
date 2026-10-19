@@ -46,7 +46,6 @@ BOARDS = {
         # without it no CPU registers and the kernel waits forever in
         # ml_wait_max_cpus() right after IOKit (grus boot k2, 2026-10-18).
         cpu_compat=b'qcom,kryo360\0qcom,kryo470', cpu_hz=(1708800000, 2304000000),  # A55, A75 (SDM712)
-        backlight=True,  # /backlight from the real D22AP tree (CoreBrightness looks it up)
         high_mem=(0x100000000, 0xfd6c0000)),
 }
 
@@ -72,20 +71,6 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
-
-
-def d22ap_backlight(path=D22AP_ADT):
-    """/backlight properties of the real D22AP tree (panel limits, nits tables)
-    without the function-* callbacks into Apple PMU/display drivers."""
-    if not os.path.exists(path):
-        print(f'warning: {path} missing, no /backlight node', file=sys.stderr)
-        return None
-    root, _ = adt.parse(open(path, 'rb').read())
-    for c in root.children:
-        if dict((k, v) for k, f, v in c.props).get('name') == b'backlight\0':
-            return [(k, v) for k, f, v in c.props
-                    if not f and k not in ('name', 'AAPL,phandle') and not k.startswith('function-')]
-    return None
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -262,9 +247,6 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', mem=None):
 
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
-    backlight_props = d22ap_backlight() if b.get('backlight') else None
-    if backlight_props:
-        product.append(node('backlight', [ph()] + backlight_props))
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
