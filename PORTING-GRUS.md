@@ -178,3 +178,14 @@ mainline Linux does on Qualcomm. Before, the platform had no
 decides the boot mode from the PMIC PON reason, which only Android and
 fastboot set, so a plain reset boots the `boot` partition. Panics are not
 turned into resets: the panic text stays on the screen.
+
+## Measured on a real grus (2026-10-19)
+
+- iOS root on userdata (51 GiB HFS+, built on macOS with `run/09-rootimg.sh`,
+  flashed as an Android sparse image), boots to SpringBoard; first boot after
+  a new image is several minutes on the Apple logo.
+- `cpus=6` and `cpus=8` (six A55 + two A75) both reach the home screen.
+- Touch: `sweettouchorient=0` (no mirroring) is correct.
+- Battery (0080 + 0081, `sweetbattery=1`): real percentage and charger
+  plug/unplug shown by iOS.
+- Untethered: the shim image flashed to `boot` starts iOS on power-on.
