@@ -27,7 +27,7 @@ boots to be bring-up boots.
 | Touch rails | L11C 3.2 V | **L8B 3.3 V** (vtouch) + **L13A 1.8 V** (iotouch) | `sweet_touch.c`, `sweet_rpmh.c` |
 | Touch orientation | as is | boot-arg `sweettouchorient` (bit 0 mirrors x, bit 1 mirrors y; default none). The DT x2x/y2y (both mirrored) was inverted on a real grus | `sweet_touch.c` |
 | USB GCC CBCRs | master 0xf010 ... | master 0xf00c, sleep 0xf010, utmi 0xf014, clkref 0x8c008 | `sweet_usb.c` |
-| Battery | PM6150 FG readout (opt-in) | static only (PM660 FG gen3 + BQ2591x) | `SweetBattery.cpp` |
+| Battery | PM6150 FG readout (opt-in) | PM660 FG gen3 monotonic SOC, VBATT/IBATT, SMB2 charger state (opt-in `sweetbattery=1`, patch 0080), 3070 mAh | `SweetBattery.cpp` |
 
 ### Command-mode panel
 
@@ -169,3 +169,12 @@ Kernel `board=grus` + `mkadt.py --board grus --highmem`, cmdline without
 - PMIC GPIO7 of PM660L configured as an input by firmware (the driver checks
   and withholds volume up otherwise; it never reconfigures the PMIC).
 - Everything the kernel does (no grus kernel boot yet).
+
+## Restart and power off (patch 0080)
+
+`SweetPlatformExpert::haltRestart` sends PSCI SYSTEM_RESET / SYSTEM_OFF, as
+mainline Linux does on Qualcomm. Before, the platform had no
+`PE_halt_restart`, so Restart / Power off from iOS could not complete. ABL
+decides the boot mode from the PMIC PON reason, which only Android and
+fastboot set, so a plain reset boots the `boot` partition. Panics are not
+turned into resets: the panic text stays on the screen.

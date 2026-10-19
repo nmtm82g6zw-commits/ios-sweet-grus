@@ -1,0 +1,199 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index b8f9ef9..93280e5 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,14 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
++#if defined(SWEET_BOARD_GRUS)
++#define SWEET_BATTERY_MAH    3070u   /* Mi 9 SE: 3070 mAh */
++#define SWEET_BATTERY_SOURCE "PM660 FG gen3 monotonic SOC"
++#else
++#define SWEET_BATTERY_MAH    5020u
++#define SWEET_BATTERY_SOURCE "PM6150 / estimated SOC"
++#endif
++
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+ public:
+@@ -102,11 +110,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (DT nominal). powerd computes C*100/M. */
++	const unsigned capacity = (SWEET_BATTERY_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SWEET_BATTERY_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -120,8 +128,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
++	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -138,7 +146,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SWEET_BATTERY_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -155,7 +163,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? SWEET_BATTERY_SOURCE : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -207,6 +215,55 @@ SweetBattery::estimatePercent(unsigned mv)
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(SWEET_BOARD_GRUS)
++	/*
++	 * PM660 (SID 0), registers as Linux qpnp-fg-gen3 / smb-reg.h (grus-p-oss):
++	 * FG BATT_SOC 0x4000: MONOTONIC_SOC 0x4009 + shadow copy 0x400a (0..255,
++	 * the FG's own learned SOC, read until both match); BATT_INFO 0x4100:
++	 * VBATT 0x41a0 (122.07 uV/LSB), IBATT 0x41a2 (signed, 488.281 uA/LSB,
++	 * positive = discharging). SMB2 charger: BATTERY_CHARGER_STATUS_1 0x1006
++	 * bits 2:0 (0 trickle .. 4 taper charging, 5 terminate, 6 inhibit,
++	 * 7 disable), USBIN INT_RT_STS 0x1310 bit 4 (plugged), POWER_PATH_STATUS
++	 * 0x160b (bit 0 valid input, bit 4 use USBIN, bit 6 USBIN suspended).
++	 * Read-only: nothing is written to the PMIC.
++	 */
++	uint8_t soc0 = 0, soc1 = 1, gusb = 0, gpath = 0, gcharger = 0;
++	uint16_t gvolt = 0, gcurr = 0;
++	bool socValid = false;
++	for (unsigned attempt = 0; fReal && attempt < 5 && !socValid; ++attempt) {
++		if (sweet_spmi_read(0, 0x4009, &soc0) || sweet_spmi_read(0, 0x400a, &soc1)) {
++			break;
++		}
++		socValid = soc0 == soc1;
++	}
++	bool gvalid = socValid && readWord(0x41a0, &gvolt) &&
++	    !sweet_spmi_read(0, 0x1310, &gusb) &&
++	    !sweet_spmi_read(0, 0x160b, &gpath) &&
++	    !sweet_spmi_read(0, 0x1006, &gcharger);
++	unsigned gmv = gvalid ? (unsigned)(((uint64_t)gvolt * 122070u) / 1000000u) : 0;
++	gvalid = gvalid && gmv >= 2800 && gmv <= 4600;
++	if (!gvalid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned gpercent = ((unsigned)soc0 * 100u + 127u) / 255u;
++	if (gpercent < 1) {
++		gpercent = 1; /* never let a bad sample trigger an empty-battery shutdown */
++	}
++	bool gexternal = (gusb & 0x10u) != 0;
++	bool gcapable = gexternal && (gpath & 1u) && (gpath & 0x10u) && !(gpath & 0x40u);
++	unsigned gstate = gcharger & 7u;
++	bool gcharging = gcapable && gstate <= 4;
++	bool gfull = gexternal && gstate == 5;
++	int gma = 0;
++	bool gcurrentValid = readWord(0x41a2, &gcurr);
++	if (gcurrentValid) {
++		int signedRaw = (gcurr & 0x8000u) ? (int)gcurr - 65536 : (int)gcurr;
++		gma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	publish(gfull ? 100 : gpercent, gmv, gma, gexternal, gcapable, gcharging,
++	    gfull, true, gcurrentValid);
++#else
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -245,6 +302,7 @@ SweetBattery::poll(void)
+ 	}
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
++#endif
+ }
+ 
+ void
+@@ -266,12 +324,7 @@ SweetBattery::start(IOService *provider)
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ #if defined(SWEET_BOARD_GRUS)
+-	/* The readout decodes PM6150 FG/charger registers; PM660 (grus) has a
+-	 * different FG gen3 layout and an external BQ2591x charger. Static only. */
+-	if (real == 1) {
+-		IOLog("SWEET BATTERY: sweetbattery=1 not supported on grus; static source\n");
+-	}
+-	real = 0;
++	/* grus: PM660 FG gen3 readout (poll above); sweetbattery=1 enables it. */
+ #endif
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..23484db 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -18,6 +18,7 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -34,6 +35,45 @@ SweetPlatformExpert::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * Restart and power off through PSCI (SYSTEM_RESET 0x84000009, SYSTEM_OFF
++ * 0x84000008), as mainline Linux does on Qualcomm SoCs; before this the
++ * platform had no PE_halt_restart, so "Restart" from iOS hung or panicked.
++ * The boot mode after a reset is decided by ABL (PMIC PON reason, set only by
++ * Android/fastboot): a plain reset boots the boot partition. Panics keep the
++ * default (no reset) so the panic text stays on the screen.
++ */
++static int
++sweet_psci_system(uint64_t function)
++{
++	register uint64_t x0 __asm__("x0") = function;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("dsb sy\n\tsmc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
++	    "x15", "x16", "x17", "memory");
++	return (int)x0; /* only reached if the firmware refused */
++}
++
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	switch (type) {
++	case kPERestartCPU:
++		IOLog("SWEET: restart (PSCI SYSTEM_RESET)\n");
++		IODelay(100000);
++		return sweet_psci_system(0x84000009ULL);
++	case kPEHaltCPU:
++	case kPEUPSDelayHaltCPU:
++		IOLog("SWEET: power off (PSCI SYSTEM_OFF)\n");
++		IODelay(100000);
++		return sweet_psci_system(0x84000008ULL);
++	default:
++		return IODTPlatformExpert::haltRestart(type);
++	}
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
