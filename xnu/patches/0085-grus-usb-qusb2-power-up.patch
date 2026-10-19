@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 428891c..5dd94be 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -126,6 +126,30 @@ sweet_usb_probe(void)
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++#if defined(SWEET_BOARD_GRUS)
++	/*
++	 * grus ABL leaves the QUSB2 PHY powered down (PWR_CTRL1 bit 0 set,
++	 * PLL_COMMON_STATUS_ONE CORE_READY clear) after fastboot, so the
++	 * controller has no UTMI clock and every endpoint command times out.
++	 * Its tune values are retained: power it up the way Linux
++	 * phy-msm-qusb-v2.c qusb_phy_init() ends (clear POWR_DOWN, wait 150 us,
++	 * expect CORE_READY) before starting the device controller.
++	 */
++	if (enabled >= 2 && !(cbcr[5] & CBCR_CLK_OFF)) {
++		vm_offset_t qphy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++		if (qphy != 0) {
++			uint32_t pwr = usb_rd(qphy, 0x210) & 0xffu;
++			if (pwr & 1u) {
++				*(volatile uint32_t *)(qphy + 0x210) = pwr & ~1u;
++				__asm__ volatile("dsb sy" ::: "memory");
++				delay(1000);
++			}
++			printf("SWEET USB: QUSB2 power-up PWR_CTRL1 0x%02x -> 0x%02x, PLL_STATUS 0x%02x (%s)\n",
++			    pwr, usb_rd(qphy, 0x210) & 0xffu, usb_rd(qphy, 0x1a0) & 0xffu,
++			    (usb_rd(qphy, 0x1a0) & 1u) ? "core ready" : "NOT ready");
++		}
++	}
++#endif
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
