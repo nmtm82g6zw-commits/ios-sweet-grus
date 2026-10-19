@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 4eadef6..b7c0598 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -512,7 +512,18 @@ touch_gt9886(void)
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0;
+ 	const unsigned first = GT9886_HEAD_LEN + GT9886_POINT_LEN;
+-	int err = touch_read(0x5d, GT9886_COOR_REG, true, buf, first);
++	int err;
++	unsigned n;
++	uint8_t sum;
++	/*
++	 * On grus some reads come back torn (status byte repeated over the first
++	 * FIFO word, rest not filled: "81 81 81 81 26 fe ..."), so the checksum
++	 * fails. Acking such a frame drops the touch: re-read it (up to 3 times,
++	 * 1 ms apart) and only ack/reject after that.
++	 */
++	for (unsigned attempt = 0;; ++attempt) {
++	bzero(buf, sizeof(buf));
++	err = touch_read(0x5d, GT9886_COOR_REG, true, buf, first);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -523,8 +534,12 @@ touch_gt9886(void)
+ 		}
+ 		return 0; /* no new touch frame: retain current contacts */
+ 	}
+-	unsigned n = buf[1] & 15u;
++	n = buf[1] & 15u;
+ 	if (n > TOUCH_MAX) {
++		if (attempt < 2) {
++			touch_wait(1);
++			continue;
++		}
+ 		return touch_gt9886_bad("count", buf, first, n);
+ 	}
+ 	if (n > 1) {
+@@ -534,13 +549,18 @@ touch_gt9886(void)
+ 			return err;
+ 		}
+ 	}
+-	uint8_t sum = 0;
++	sum = 0;
+ 	for (unsigned i = 0; i < n * GT9886_POINT_LEN + GT9886_HEAD_LEN; ++i) {
+ 		sum = (uint8_t)(sum + buf[i]);
+ 	}
+-	if (sum != 0) {
++	if (sum == 0) {
++		break;
++	}
++	if (attempt >= 2) {
+ 		return touch_gt9886_bad("checksum", buf, n * GT9886_POINT_LEN + GT9886_HEAD_LEN, sum);
+ 	}
++	touch_wait(1);
++	}
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		const uint8_t *p = buf + 2u + i * GT9886_POINT_LEN;
+ 		if (i == n - 1u && p[0] >= 0x80u) {
