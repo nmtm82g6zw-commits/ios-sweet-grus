@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index df6e815..624685c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -549,6 +549,33 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	/*
++	 * Brightness bring-up: log every call of the selectors that can carry it
++	 * (50 SetBrightnessCorrection, 66 SPLCSetBrightness, 68 SetParameter,
++	 * 84 SetContrast) with its inputs, at most 300 lines per boot.
++	 */
++	static uint32_t sweet_fb_param_lines;
++	if ((selector == 50 || selector == 66 || selector == 68 || selector == 84) &&
++	    sweet_fb_param_lines < 300) {
++		uint8_t b[16];
++		uint32_t n = 0;
++		bzero(b, sizeof(b));
++		if (args->structureInputDescriptor == NULL && args->structureInput != NULL) {
++			n = args->structureInputSize < sizeof(b) ? args->structureInputSize : (uint32_t)sizeof(b);
++			memcpy(b, args->structureInput, n);
++		}
++		char pname[32];
++		proc_selfname(pname, sizeof(pname));
++		sweet_fb_param_lines++;
++		IOLog("SWEET FB: %s param sel %u s %#llx %#llx st %u %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++		    pname, selector,
++		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++		    args->structureInputSize,
++		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
++		    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++	}
++
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
