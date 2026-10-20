@@ -1,0 +1,225 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index cd45142..16f67e4 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -46,6 +46,8 @@ static void sweet_cpufreq_start(void);
+ static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ static void sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu);
+ static void sweet_gpu_smmu_dump(void);
++static int sweet_gpu_smmu_map(void);
++static void sweet_hfi_start(vm_offset_t gmu);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -566,6 +568,178 @@ sweet_gpu_smmu_dump(void)
+ 	}
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 4b (sweetgpu=3): GMU memory through the GPU
++ * SMMU, then HFI. 0095 showed a clean SMMU: 5 SMRs invalid, S2CRs fault,
++ * 5 empty context banks. Like Linux arm-smmu.c / io-pgtable-arm.c:
++ *  - SMR0 = valid, ID 4 mask 1 (GMU stream IDs 4 and 5, sdm670-gpu.dtsi);
++ *    S2CR0 = translate in context bank 0;
++ *  - CB0: CBAR S1 translation + S2 bypass (BPSHCFG NSH, MEMATTR WB), CBA2R
++ *    VA64, TCR T0SZ 32 / 4 KiB granule / non-cacheable outer-shareable
++ *    walks / EPD1, TCR2 PASIZE 36 bit, MAIR0 = NC, WBRWA, device, SCTLR
++ *    M|TRE|AFE|CFRE (faults logged in FSR, no interrupt);
++ *  - a 3-level table (L1 -> L2 -> L3, 4 KiB pages) mapping
++ *    SWEET_GMU_IOVA 0x60000000 (Linux's uncached GMU range) to a 64 KiB
++ *    physically contiguous kernel buffer, non-cacheable: dummy page +0x0,
++ *    HFI +0x1000 (queue table, command queue +0x2000, response queue
++ *    +0x3000), debug +0x5000, log +0x9000.
++ * The CPU side uses cacheable mappings and cleans/invalidates to PoC.
++ */
++#define SWEET_GMU_IOVA 0x60000000u
++static uint8_t sweet_gmu_mem[0x13000] __attribute__((aligned(0x1000)));
++#define GMU_DATA (sweet_gmu_mem + 0x3000)
++
++static int
++sweet_gpu_smmu_map(void)
++{
++	vm_offset_t s = ml_io_map(0x05040000, 0x10000);
++	if (s == 0) {
++		return -1;
++	}
++	uint64_t *l1 = (uint64_t *)sweet_gmu_mem, *l2 = l1 + 512, *l3 = l2 + 512;
++	uint64_t pa_l1 = ml_static_vtop((vm_offset_t)l1), pa_l2 = ml_static_vtop((vm_offset_t)l2);
++	uint64_t pa_l3 = ml_static_vtop((vm_offset_t)l3), pa_d = ml_static_vtop((vm_offset_t)GMU_DATA);
++	bzero(sweet_gmu_mem, sizeof(sweet_gmu_mem));
++	l1[(SWEET_GMU_IOVA >> 30) & 511] = pa_l2 | 3u;
++	l2[(SWEET_GMU_IOVA >> 21) & 511] = pa_l3 | 3u;
++	for (unsigned i = 0; i < 16; i++) {
++		/* page | AttrIndx 0 (NC) | AP unpriv RW | SH outer | AF */
++		l3[((SWEET_GMU_IOVA >> 12) & 511) + i] = (pa_d + i * 0x1000u) | 3u | (1u << 6) | (2u << 8) | (1u << 10);
++	}
++
++	/* HFI queue table (a6xx_hfi_init, legacy: response queue id 4) */
++	uint32_t *t = (uint32_t *)(GMU_DATA + 0x1000);
++	t[0] = 0;                              /* version */
++	t[1] = (6 + 2 * 12) * 4;               /* size: header + 2 queue headers (bytes, as Linux) */
++	t[2] = 6;                              /* qhdr0_offset (dwords) */
++	t[3] = 12;                             /* qhdr_size (dwords) */
++	t[4] = 2; t[5] = 2;                    /* num/active queues */
++	for (unsigned q = 0; q < 2; q++) {
++		uint32_t *h = t + 6 + q * 12;
++		h[0] = 1;                          /* status */
++		h[1] = SWEET_GMU_IOVA + 0x2000 + q * 0x1000;
++		h[2] = (10u << 8) | (q ? 4u : 0u); /* type */
++		h[3] = 0x1000 / 4;                 /* size in dwords */
++		h[6] = 1; h[7] = 1; h[8] = 1;      /* rx/tx watermark, rx_request */
++	}
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_gmu_mem, sizeof(sweet_gmu_mem));
++
++	vm_offset_t cb = s + 0x8000;           /* context bank 0 */
++	smmu_wr(cb, 0x0, 0);                   /* SCTLR off while programming */
++	smmu_wr(s, 0x1000, (1u << 16) | (0xfu << 12) | (3u << 8));   /* CBAR0 */
++	smmu_wr(s, 0x1800, 1);                 /* CBA2R0: VA64 */
++	smmu_wr(cb, 0x10, 1);                  /* TCR2: PASIZE 36 bit */
++	smmu_wr(cb, 0x30, 32u | (2u << 12) | (1u << 23));             /* TCR */
++	smmu_wr(cb, 0x38, 0x0004ff44u);        /* MAIR0 */
++	smmu_wr(cb, 0x20, (uint32_t)pa_l1);    /* TTBR0 lo */
++	smmu_wr(cb, 0x24, (uint32_t)(pa_l1 >> 32));                   /* TTBR0 hi, ASID 0 */
++	smmu_wr(cb, 0x58, ~0u);                /* clear FSR */
++	smmu_wr(cb, 0x610, 0);                 /* TLBIASID 0 */
++	smmu_wr(cb, 0x7f0, 0);                 /* TLBSYNC */
++	int i;
++	for (i = 0; i < 1000 && (smmu_rd(cb, 0x7f4) & 1u); i++) {
++		delay(10);
++	}
++	smmu_wr(cb, 0x0, 0x27);                /* SCTLR: CFRE|AFE|TRE|M */
++	smmu_wr(s, 0xc00, 0);                  /* S2CR0: translate, CB 0 */
++	smmu_wr(s, 0x800, (1u << 31) | (1u << 16) | 4u);              /* SMR0: SID 4/5 */
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SMMU: GMU iova 0x%x -> pa 0x%llx (tables at 0x%llx), CB0 SCTLR 0x%x TCR 0x%x TTBR0 0x%08x%08x SMR0 0x%08x S2CR0 0x%08x tlbsync %s\n",
++	    SWEET_GMU_IOVA, (unsigned long long)pa_d, (unsigned long long)pa_l1, smmu_rd(cb, 0x0),
++	    smmu_rd(cb, 0x30), smmu_rd(cb, 0x24), smmu_rd(cb, 0x20), smmu_rd(s, 0x800),
++	    smmu_rd(s, 0xc00), i < 1000 ? "ok" : "TIMEOUT");
++	return 0;
++}
++
++/* a6xx_hfi_queue_write + a6xx_hfi_wait_for_ack (legacy GMU, polled). */
++static int
++sweet_hfi_send(vm_offset_t gmu, unsigned id, uint32_t *msg, unsigned dwords, uint32_t *resp)
++{
++	static unsigned seq;
++	uint32_t *t = (uint32_t *)(GMU_DATA + 0x1000);
++	uint32_t *cmdh = t + 6, *rsph = t + 18;
++	uint32_t *cmdq = (uint32_t *)(GMU_DATA + 0x2000), *rspq = (uint32_t *)(GMU_DATA + 0x3000);
++	seq = (seq + 1) % 0xfff;
++	msg[0] = (seq << 20) | (0u << 16) | (dwords << 8) | id;
++	FlushPoC_DcacheRegion((vm_offset_t)t, 0x3000);
++	unsigned w = cmdh[11];
++	for (unsigned i = 0; i < dwords; i++) {
++		cmdq[w] = msg[i];
++		w = (w + 1) % 0x400;
++	}
++	cmdh[11] = w;
++	FlushPoC_DcacheRegion((vm_offset_t)t, 0x3000);
++	*(volatile uint32_t *)(gmu + (0x5194u << 2)) = 1;     /* HOST2GMU_INTR_SET */
++	int n;
++	uint32_t info = 0;
++	for (n = 0; n < 500; n++) {            /* up to 50 ms */
++		info = usb_rd(gmu, 0x5192u << 2);  /* GMU2HOST_INTR_INFO */
++		if (info & 1u) {
++			break;
++		}
++		delay(100);
++	}
++	if (!(info & 1u)) {
++		printf("SWEET HFI: msg %u seq %u: no response (intr 0x%x, cmd r/w %u/%u)\n", id, seq,
++		    info, cmdh[10], cmdh[11]);
++		return -1;
++	}
++	*(volatile uint32_t *)(gmu + (0x5191u << 2)) = 1;     /* GMU2HOST_INTR_CLR */
++	FlushPoC_DcacheRegion((vm_offset_t)t, 0x3000);
++	unsigned r = rsph[10], k = 0;
++	while (r != rsph[11] && k < 20) {
++		uint32_t hdr = rspq[r];
++		unsigned sz = (hdr >> 8) & 0xff;
++		for (unsigned i = 0; i < sz && i < 20; i++) {
++			resp[i] = rspq[r];
++			r = (r + 1) % 0x400;
++		}
++		k += sz ? sz : 1;
++		rsph[10] = r;
++		FlushPoC_DcacheRegion((vm_offset_t)t, 0x3000);
++		if ((hdr & 0xff) == 100) {         /* F2H_MSG_ERROR */
++			printf("SWEET HFI: GMU error code %u (0x%x 0x%x)\n", resp[1], resp[2], resp[3]);
++			continue;
++		}
++		printf("SWEET HFI: msg %u seq %u -> ack 0x%08x ret 0x%08x error %u payload 0x%x 0x%x (%u ms)\n",
++		    id, seq, hdr, resp[1], resp[2], resp[3], resp[4], n / 10);
++		return resp[2] ? -2 : 0;
++	}
++	printf("SWEET HFI: msg %u seq %u: interrupt but empty response queue\n", id, seq);
++	return -1;
++}
++
++static void
++sweet_hfi_start(vm_offset_t gmu)
++{
++	uint32_t m[8], resp[20];
++	*(volatile uint32_t *)(gmu + (0x5186u << 2)) = 1;     /* HFI_CTRL_INIT */
++	int n;
++	for (n = 0; n < 100 && !(usb_rd(gmu, 0x5180u << 2) & 1u); n++) {
++		delay(100);
++	}
++	vm_offset_t cb = ml_io_map(0x05048000, 0x1000);
++	printf("SWEET HFI: CTRL_STATUS 0x%x after %d00 us; SMMU CB0 FSR 0x%x FAR 0x%08x%08x FSYNR0 0x%x\n",
++	    usb_rd(gmu, 0x5180u << 2), n, cb ? smmu_rd(cb, 0x58) : 0, cb ? smmu_rd(cb, 0x64) : 0,
++	    cb ? smmu_rd(cb, 0x60) : 0, cb ? smmu_rd(cb, 0x68) : 0);
++	if (!(usb_rd(gmu, 0x5180u << 2) & 1u)) {
++		return;
++	}
++	bzero(m, sizeof(m));
++	m[1] = 0;                              /* seg_id */
++	m[2] = SWEET_GMU_IOVA + 0x5000;        /* dbg_buffer_addr */
++	m[3] = 0x4000;                         /* dbg_buffer_size */
++	m[4] = 1;                              /* boot_state: GMU_COLD_BOOT */
++	if (sweet_hfi_send(gmu, 0, m, 5, resp) != 0) {     /* H2F_MSG_INIT */
++		return;
++	}
++	bzero(m, sizeof(m));
++	m[1] = (1u << 28) | (1u << 19) | (1u << 17);       /* supported version 1.10 */
++	if (sweet_hfi_send(gmu, 1, m, 2, resp) == 0) {     /* H2F_MSG_FW_VERSION */
++		printf("SWEET HFI: GMU firmware version 0x%08x\n", resp[3]);
++	}
++}
++
+ /*
+  * Adreno 616 bring-up, step 3 (sweetgpu=2): boot the GMU firmware, following
+  * Linux a6xx_gmu.c for the a630 family ("legacy" GMU, a615 chip id
+@@ -684,11 +858,20 @@ sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu)
+ 	}
+ 	GW(0x501c, 0);                         /* CM3_FW_INIT_RESULT */
+ 	GW(0x5001, 2);                         /* CM3_BOOT_CONFIG */
+-	GW(0x5185, 0); GW(0x5184, 0);          /* HFI queue table: none yet */
++	int level = 0;
++	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	int hfi = level >= 3 && sweet_gpu_smmu_map() == 0;
++	if (hfi) {
++		GW(0x5185, SWEET_GMU_IOVA + 0x1000);   /* HFI_QTBL_ADDR */
++		GW(0x5184, 1);                     /* HFI_QTBL_INFO */
++	} else {
++		GW(0x5185, 0); GW(0x5184, 0);      /* HFI queue table: none */
++	}
+ 	GW(0x9311, (1u << 31) | (0xau << 18) | 0xa0u);   /* AHB_FENCE_RANGE_0 */
+ 	GW(0x502d, 0x4052);                    /* CM3_CFG */
+ 	GW(0x5182, 0x06015000u);               /* HFI_SFR_ADDR = GMU chip id (a615) */
+-	GW(0x5100, 0);                         /* PWR_COL_CP_MSG: no log buffer */
++	/* PWR_COL_CP_MSG: GMU log buffer (16 KiB = 4 pages - 1) */
++	GW(0x5100, hfi ? (SWEET_GMU_IOVA + 0x9000) | 3u : 0);
+ 	GW(0x4c0f, 1); GW(0x4c00, 1); GW(0x4c01, 1);   /* SYS_BUS/ICACHE/DCACHE_CONFIG */
+ 	GW(0x50c0, 0x9c40400u);                /* PWR_COL_INTER_FRAME_CTRL */
+ 	GW(0x50e8, GR(0x50e8) | 1u | (1u << 4) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11));
+@@ -720,6 +903,9 @@ sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu)
+ 	if ((res & mask) != want) {
+ 		GW(0x5000, 1);                     /* stop the CM3 again */
+ 	}
++	if (hfi && (res & mask) == want) {
++		sweet_hfi_start(gmu);
++	}
+ 	sweet_gpu_smmu_dump();
+ #undef PW
+ #undef G
