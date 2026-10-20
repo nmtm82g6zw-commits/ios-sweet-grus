@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 93168d5..475b45e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -42,6 +42,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static void sweet_cpufreq_start(void);
++static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -416,6 +417,86 @@ sweet_cpufreq_set(void)
+ #endif /* SWEET_BOARD_GRUS: sweet's cpufreq block is not mapped here */
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 2 (boot-arg sweetgpu=1): power the CX side
++ * (GMU) the way Linux does before loading GMU firmware:
++ * gdsc.c gdsc_enable(gpu_cx_gdsc): GDSCR 0x106c wait fields
++ * EN_REST 2 / EN_FEW 8 / CLK_DIS 8, clear SW_COLLAPSE, poll PWR_ON (bit 31)
++ * of gds_hw_ctrl 0x1540; GCC ddrss_gpu_axi 0x44038 and gpu_memnoc_gfx
++ * 0x7100c bit 0 (voted, no halt check); GPU_CC cx_gmu 0x1098 bit 0, poll
++ * CLK_OFF. gmu_clk_src (RCG 0x1120) is left at its reset source (TCXO).
++ * Then a6xx_gmu.xml registers (dword offsets from GMU 0x506a000):
++ * CM3_SYSRESET 0x5000 is set to 1 (CM3 held in reset, as Linux does before
++ * loading firmware) and ITCM word 0 (0xc00) gets a write/read-back test.
++ * The GX side (gfx rail, GX GDSC) belongs to the GMU and is not touched.
++ */
++static int
++sweet_poll_bit(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (int i = 0; i < 1000; i++) {
++		if ((usb_rd(base, off) & mask) == want) {
++			return 1;
++		}
++		delay(10);
++	}
++	return 0;
++}
++
++static void
++sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc)
++{
++	volatile uint32_t *r;
++	r = (volatile uint32_t *)(gcc + 0x44038); *r |= 1u;
++	r = (volatile uint32_t *)(gcc + 0x7100c); *r |= 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	delay(10);
++	printf("SWEET GPU: axi 0x%08x memnoc 0x%08x; CX GDSC on...\n",
++	    usb_rd(gcc, 0x44038), usb_rd(gcc, 0x7100c));
++
++	r = (volatile uint32_t *)(cc + 0x106c);
++	uint32_t g = *r & ~((0xfu << 20) | (0xfu << 16) | (0xfu << 12));
++	g |= (0x2u << 20) | (0x8u << 16) | (0x8u << 12);   /* grus gdsc.dtsi clk-dis-wait 8 */
++	*r = g & ~1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	int ok = sweet_poll_bit(cc, 0x1540, 1u << 31, 1u << 31);
++	printf("SWEET GPU: CX GDSC %s: GDSCR 0x%08x hw_ctrl 0x%08x\n", ok ? "on" : "TIMEOUT",
++	    usb_rd(cc, 0x106c), usb_rd(cc, 0x1540));
++	if (!ok) {
++		return;
++	}
++
++	r = (volatile uint32_t *)(cc + 0x1098); *r |= 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	ok = sweet_poll_bit(cc, 0x1098, CBCR_CLK_OFF, 0);
++	printf("SWEET GPU: cx_gmu %s 0x%08x cxo 0x%08x gmu_rcg cmd 0x%08x cfg 0x%08x\n",
++	    ok ? "on" : "TIMEOUT", usb_rd(cc, 0x1098), usb_rd(cc, 0x109c),
++	    usb_rd(cc, 0x1120), usb_rd(cc, 0x1124));
++	if (!ok) {
++		return;
++	}
++
++	vm_offset_t gmu = ml_io_map(0x0506a000, 0x30000);
++	if (gmu == 0) {
++		return;
++	}
++#define GMU_REG(x) ((uint32_t)(x) << 2)
++	printf("SWEET GPU: GMU sysreset 0x%x boot_cfg 0x%x fw_init 0x%x hfi_ctrl 0x%x general0 0x%x ao_int 0x%x fence 0x%x\n",
++	    usb_rd(gmu, GMU_REG(0x5000)), usb_rd(gmu, GMU_REG(0x5001)), usb_rd(gmu, GMU_REG(0x501c)),
++	    usb_rd(gmu, GMU_REG(0x5180)), usb_rd(gmu, GMU_REG(0x51c5)), usb_rd(gmu, GMU_REG(0x9305)),
++	    usb_rd(gmu, GMU_REG(0x9310)));
++	*(volatile uint32_t *)(gmu + GMU_REG(0x5000)) = 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	volatile uint32_t *itcm = (volatile uint32_t *)(gmu + GMU_REG(0xc00));
++	uint32_t old = itcm[0];
++	itcm[0] = 0x5eed1234u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t back = itcm[0];
++	itcm[0] = old;
++	printf("SWEET GPU: GMU ITCM[0] 0x%08x write test %s (0x%08x)\n", old,
++	    back == 0x5eed1234u ? "OK" : "FAILED", back);
++#undef GMU_REG
++}
++
+ /*
+  * Adreno 616 bring-up, step 1: read-only state probe (like the USB probe).
+  * grus-p-oss sdm670-gpu.dtsi / msm-gdsc-sdm845.dtsi / gcc-sdm845.c /
+@@ -447,6 +528,11 @@ sweet_gpu_probe(void)
+ 	printf("SWEET GPU: CX GDSC 0x%08x GX GDSC 0x%08x cx_gmu 0x%08x cxo 0x%08x gx_gfx3d 0x%08x\n",
+ 	    usb_rd(cc, 0x106c), usb_rd(cc, 0x100c), usb_rd(cc, 0x1098), usb_rd(cc, 0x109c),
+ 	    usb_rd(cc, 0x1054));
++	int on = 0;
++	PE_parse_boot_argn("sweetgpu", &on, sizeof(on));
++	if (on >= 1) {
++		sweet_gpu_cx_on(gcc, cc);
++	}
+ #endif
+ }
+ 
