@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 73d8fdf..844e29f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -51,7 +51,8 @@ static void ud_sleep_ms(unsigned ms);
+ static void sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu);
+ static void sweet_gpu_smmu_dump(void);
+ static int sweet_gpu_smmu_map(void);
+-static void sweet_gpu_zap(void);
++static int sweet_gpu_zap(void);
++static void sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu);
+ static void sweet_hfi_start(vm_offset_t gmu);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -619,7 +620,10 @@ sweet_gpu_smmu_dump(void)
+  * The CPU side uses cacheable mappings and cleans/invalidates to PoC.
+  */
+ #define SWEET_GMU_IOVA 0x60000000u
+-static uint8_t sweet_gmu_mem[0x13000] __attribute__((aligned(0x1000)));
++/* tables 0x3000 | GMU 64 KiB at iova 0x60000000 | GPU 64 KiB at iova 0x60100000 */
++static uint8_t sweet_gmu_mem[0x23000] __attribute__((aligned(0x1000)));
++#define SWEET_GPU_IOVA 0x60100000u
++#define GPU_DATA (sweet_gmu_mem + 0x13000)
+ #define GMU_DATA (sweet_gmu_mem + 0x3000)
+ 
+ static int
+@@ -638,6 +642,8 @@ sweet_gpu_smmu_map(void)
+ 	for (unsigned i = 0; i < 16; i++) {
+ 		/* page | AttrIndx 0 (NC) | AP unpriv RW | SH outer | AF */
+ 		l3[((SWEET_GMU_IOVA >> 12) & 511) + i] = (pa_d + i * 0x1000u) | 3u | (1u << 6) | (2u << 8) | (1u << 10);
++		/* GPU area (sweet_gpu_cp_test): same table, 1 MiB higher */
++		l3[((SWEET_GPU_IOVA >> 12) & 511) + i] = (pa_d + 0x10000u + i * 0x1000u) | 3u | (1u << 6) | (2u << 8) | (1u << 10);
+ 	}
+ 
+ 	/* HFI queue table (a6xx_hfi_init, legacy: response queue id 4) */
+@@ -690,6 +696,10 @@ sweet_gpu_smmu_map(void)
+ 	smmu_wr(s, 0x800, (1u << 31) | 5u);    /* SMR0: SID 5 */
+ 	smmu_wr(s, 0xc04, 0);                  /* S2CR1: translate, CB 0 */
+ 	smmu_wr(s, 0x804, (1u << 31) | 4u);    /* SMR1: SID 4 */
++	smmu_wr(s, 0xc08, 0);                  /* S2CR2: translate, CB 0 */
++	smmu_wr(s, 0x808, (1u << 31) | 0u);    /* SMR2: SID 0 (GPU user, CP) */
++	smmu_wr(s, 0xc0c, 0);                  /* S2CR3: translate, CB 0 */
++	smmu_wr(s, 0x80c, (1u << 31) | 1u);    /* SMR3: SID 1 */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	uint32_t smr0 = smmu_rd(s, 0x800), smr1 = smmu_rd(s, 0x804);
+ 	GPU_STEP("SWEET SMMU: SMR0 0x%08x S2CR0 0x%08x SMR1 0x%08x S2CR1 0x%08x sGFSR 0x%x sCR0 0x%08x\n",
+@@ -993,7 +1003,7 @@ sweet_scm(uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
+ 	return sweet_scm_svc(2, cmd, arginfo, a0, a1, a2, r1);
+ }
+ 
+-static void
++static int
+ sweet_gpu_zap(void)
+ {
+ 	DTEntry node;
+@@ -1003,14 +1013,14 @@ sweet_gpu_zap(void)
+ 	    SecureDTGetProperty(node, "zap-mdt", &mdt, &mdt_size) != kSuccess ||
+ 	    mdt_size < 52 || mdt_size > sizeof(sweet_zap_meta)) {
+ 		printf("SWEET ZAP: no zap-mdt in the ADT (size %u)\n", mdt_size);
+-		return;
++		return -1;
+ 	}
+ 	const uint8_t *e = mdt;
+ 	uint32_t phoff = *(const uint32_t *)(e + 28);
+ 	unsigned phent = *(const uint16_t *)(e + 42), phnum = *(const uint16_t *)(e + 44);
+ 	if (e[4] != 1 || phent != 32 || phnum > 8 || phoff + phent * phnum > mdt_size) {
+ 		printf("SWEET ZAP: unexpected mdt header\n");
+-		return;
++		return -1;
+ 	}
+ 	/*
+ 	 * 0100: PAS_IS_SUPPORTED(13) returned 0 with supported = 0. Check the
+@@ -1044,7 +1054,7 @@ sweet_gpu_zap(void)
+ 	max = (max + 0xfffu) & ~0xfffu;
+ 	if (min == ~0u || !reloc || max - min > ZAP_MEM_SIZE) {
+ 		printf("SWEET ZAP: segments 0x%x-0x%x reloc %d do not fit 0x%x\n", min, max, reloc, ZAP_MEM_SIZE);
+-		return;
++		return -1;
+ 	}
+ 
+ 	bzero(sweet_zap_meta, sizeof(sweet_zap_meta));
+@@ -1055,16 +1065,16 @@ sweet_gpu_zap(void)
+ 	GPU_STEP("SWEET ZAP: PAS_INIT_IMAGE(metadata pa 0x%llx, %u bytes) -> ret %lld\n",
+ 	    (unsigned long long)meta_pa, mdt_size, (long long)rc);
+ 	if (rc != 0) {
+-		return;
++		return -1;
+ 	}
+ 	rc = sweet_scm(2, 3, ZAP_PAS, ZAP_MEM_PA, max - min, NULL);
+ 	GPU_STEP("SWEET ZAP: PAS_MEM_SETUP(0x%x, 0x%x) -> ret %lld\n", ZAP_MEM_PA, max - min, (long long)rc);
+ 	if (rc != 0) {
+-		return;
++		return -1;
+ 	}
+ 	vm_offset_t mem = ml_io_map(ZAP_MEM_PA, ZAP_MEM_SIZE);
+ 	if (mem == 0) {
+-		return;
++		return -1;
+ 	}
+ 	for (unsigned i = 0; i < phnum; i++) {
+ 		const uint32_t *ph = (const uint32_t *)(e + phoff + i * 32);
+@@ -1077,7 +1087,7 @@ sweet_gpu_zap(void)
+ 		unsigned int seg_size = 0;
+ 		if (SecureDTGetProperty(node, pname, &seg, &seg_size) != kSuccess || seg_size < ph[4]) {
+ 			printf("SWEET ZAP: segment %s missing (%u < %u)\n", pname, seg_size, ph[4]);
+-			return;
++			return -1;
+ 		}
+ 		uint32_t off = ph[3] - min;
+ 		for (uint32_t k = 0; k < ph[5]; k += 4) {
+@@ -1093,8 +1103,146 @@ sweet_gpu_zap(void)
+ 	rc = sweet_scm(5, 1, ZAP_PAS, 0, 0, NULL);
+ 	GPU_STEP("SWEET ZAP: PAS_AUTH_AND_RESET(%u) -> ret %lld%s\n", ZAP_PAS, (long long)rc,
+ 	    rc == 0 ? ": zap shader loaded, GPU may leave secure mode" : "");
++	return rc == 0 ? 0 : -1;
++}
++
++/*
++ * Adreno 616 bring-up, step 7 (sweetgpu=6): the first command the GPU runs,
++ * following Linux a6xx_gpu.c hw_init / a6xx_cp_init for a615 (no hwcg,
++ * CP protect or UBWC yet: not needed for CP_MEM_WRITE). GPU memory: SIDs
++ * 0/1 to context bank 0 (sweet_gpu_smmu_map), iova 0x60100000:
++ * +0 SQE microcode (a630_sqe.fw minus its first dword, like
++ * adreno_fw_create_bo), +0x8000 ring buffer (4 KiB), +0x9000 target.
++ * Ring: PKT7 CP_ME_INIT (8 dwords), CP_SET_SECURE_MODE 0 (needs the zap
++ * shader), CP_MEM_WRITE 0xc0ffee to +0x9000; each followed by a wait for
++ * CP_RB_RPTR to reach the write pointer.
++ */
++#define GR(r) usb_rd(g, (uint32_t)(r) << 2)
++#define GWR(r, v) (*(volatile uint32_t *)(g + ((uint32_t)(r) << 2)) = (v))
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	       (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (pm4_parity(cnt) << 15) | ((op & 0x7fu) << 16) | (pm4_parity(op) << 23);
+ }
+ 
++static int
++sweet_cp_kick(vm_offset_t g, uint32_t wptr, const char *what)
++{
++	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA, 0x10000);
++	__asm__ volatile("dsb sy" ::: "memory");
++	GWR(0x807, wptr);                      /* CP_RB_WPTR */
++	uint32_t rptr = 0, st = 0;
++	int n;
++	for (n = 0; n < 2000; n++) {           /* up to 200 ms */
++		rptr = GR(0x806);                  /* CP_RB_RPTR */
++		st = GR(0x210);                    /* RBBM_STATUS */
++		if (rptr == wptr && !(st & ~1u)) {    /* idle except CP_AHB_BUSY_CX_MASTER */
++			break;
++		}
++		delay(100);
++	}
++	vm_offset_t cb = ml_io_map(0x05048000, 0x1000);
++	GPU_STEP("SWEET CP: %s: rptr %u/%u RBBM_STATUS 0x%08x INT0 0x%08x HW_FAULT 0x%08x STATUS_1 0x%08x SQE_STAT 0x%x SMMU FSR 0x%x FAR 0x%08x%08x (%d00 us)\n",
++	    what, rptr, wptr, st, GR(0x201), GR(0x821), GR(0x825), GR(0x908),
++	    cb ? smmu_rd(cb, 0x58) : 0, cb ? smmu_rd(cb, 0x64) : 0, cb ? smmu_rd(cb, 0x60) : 0, n);
++	return rptr == wptr ? 0 : -1;
++}
++
++static void
++sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu)
++{
++	(void)gmu;
++	DTEntry node;
++	void const *sqe = NULL;
++	unsigned int sqe_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "sqe-fw", &sqe, &sqe_size) != kSuccess ||
++	    sqe_size < 8 || sqe_size - 4 > 0x8000) {
++		printf("SWEET CP: no sqe-fw in the ADT (size %u)\n", sqe_size);
++		return;
++	}
++	uint32_t *ring = (uint32_t *)(GPU_DATA + 0x8000);
++	volatile uint32_t *dst = (volatile uint32_t *)(GPU_DATA + 0x9000);
++	bzero(GPU_DATA, 0x10000);
++	bcopy((const uint8_t *)sqe + 4, GPU_DATA, sqe_size - 4);
++	dst[0] = 0xdeadbeefu;
++	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA, 0x10000);
++	GPU_STEP("SWEET CP: SQE version 0x%08x 0x%08x (%u bytes), hw_init\n",
++	    ((const uint32_t *)sqe)[0], ((const uint32_t *)sqe)[1], sqe_size);
++
++	/* hw_init (a615: GBIF, no hw_apriv) */
++	GWR(0x3c45, 0); (void)GR(0x3c45);      /* GBIF_HALT */
++	GWR(0x16, 0); (void)GR(0x16);          /* RBBM_GBIF_HALT */
++	GWR(0xf803, 0);                        /* RBBM_SECVID_TSB_CNTL */
++	GWR(0xf800, 0); GWR(0xf801, 0); GWR(0xf802, 0);  /* TSB trusted base/size */
++	static const uint16_t addr_mode[12] = { 0x842, 0xc01, 0x8601, 0x8e05, 0x9e01, 0xbe05,
++	    0xa601, 0x9601, 0xe00, 0xae01, 0xb601, 0xf810 };
++	for (unsigned i = 0; i < 12; i++) {
++		GWR(addr_mode[i], 1);              /* 64-bit addressing */
++	}
++	GWR(0x10, 3);                          /* RBBM_VBIF_CLIENT_QOS_CNTL */
++	GWR(0x50b, 0xffffffffu);               /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	GWR(0xe05, 0xffffffc0u); GWR(0xe06, 0x0001ffffu);   /* UCHE_WRITE_RANGE_MAX */
++	GWR(0xe09, 0xfffff000u); GWR(0xe0a, 0x0001ffffu);   /* UCHE_TRAP_BASE */
++	GWR(0xe07, 0xfffff000u); GWR(0xe08, 0x0001ffffu);   /* UCHE_WRITE_THRU_BASE */
++	GWR(0xe0b, 0x00100000u); GWR(0xe0c, 0);             /* UCHE_GMEM_RANGE_MIN 1 MiB */
++	GWR(0xe0d, 0x00100000u + 0x80000u - 1); GWR(0xe0e, 0);  /* + 512 KiB GMEM - 1 */
++	GWR(0xe18, 0x804);                     /* UCHE_FILTER_CNTL */
++	GWR(0xe17, 0x4);                       /* UCHE_CACHE_WAYS */
++	GWR(0x8c2, 0x010000c0u);               /* CP_ROQ_THRESHOLDS_2 */
++	GWR(0x8c1, 0x8040362cu);               /* CP_ROQ_THRESHOLDS_1 */
++	GWR(0x8c3, 128);                       /* CP_MEM_POOL_SIZE */
++	GWR(0x9e00, 0x0018000u);               /* PC_DBG_ECO_CNTL: a615 prim fifo threshold */
++	GWR(0x98d, 1);                         /* CP_AHB_CNTL: AHB default slave response ERROR */
++	GWR(0x500, 1);                         /* RBBM_PERFCTR_CNTL */
++	GWR(0x1f, (1u << 30) | 0x1fffffu);     /* RBBM_INTERFACE_HANG_INT_CNTL */
++	GWR(0xe19, (1u << 7) | 1u);            /* UCHE_CLIENT_PF */
++	GWR(0x38, 0);                          /* RBBM_INT_0_MASK: polled, no IRQ */
++
++	GWR(0x830, SWEET_GPU_IOVA); GWR(0x831, 0);          /* CP_SQE_INSTR_BASE */
++	GWR(0x800, SWEET_GPU_IOVA + 0x8000); GWR(0x801, 0); /* CP_RB_BASE */
++	/* MSM_GPU_RB_CNTL_DEFAULT for 4 KiB: BUFSZ log2(4096/8) = 9, BLKSZ log2(32/8) = 2, NO_UPDATE */
++	GWR(0x802, 9u | (2u << 8) | (1u << 27));
++	GWR(0x807, 0);                         /* CP_RB_WPTR */
++	__asm__ volatile("dsb sy" ::: "memory");
++	GWR(0x808, 1);                         /* CP_SQE_CNTL: start the CP */
++	delay(1000);
++	GPU_STEP("SWEET CP: SQE started: RBBM_STATUS 0x%08x HW_FAULT 0x%08x SQE_STAT 0x%x RB_CNTL 0x%x\n",
++	    GR(0x210), GR(0x821), GR(0x908), GR(0x802));
++
++	unsigned w = 0;
++	ring[w++] = pkt7(0x48, 8);             /* CP_ME_INIT */
++	ring[w++] = 0x0000002fu;
++	ring[w++] = 0x00000003u;
++	ring[w++] = 0x20000000u;
++	ring[w++] = 0; ring[w++] = 0; ring[w++] = 0; ring[w++] = 0; ring[w++] = 0;
++	if (sweet_cp_kick(g, w, "CP_ME_INIT")) {
++		return;
++	}
++	ring[w++] = pkt7(0x66, 1);             /* CP_SET_SECURE_MODE */
++	ring[w++] = 0;
++	if (sweet_cp_kick(g, w, "CP_SET_SECURE_MODE 0")) {
++		return;
++	}
++	ring[w++] = pkt7(0x3d, 3);             /* CP_MEM_WRITE */
++	ring[w++] = SWEET_GPU_IOVA + 0x9000;
++	ring[w++] = 0;
++	ring[w++] = 0x00c0ffeeu;
++	(void)sweet_cp_kick(g, w, "CP_MEM_WRITE");
++	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA + 0x9000, 0x1000);
++	GPU_STEP("SWEET CP: target word 0x%08x -> %s\n", dst[0],
++	    dst[0] == 0x00c0ffeeu ? "THE GPU EXECUTED OUR COMMAND" : "not written");
++}
++#undef GR
++#undef GWR
++
+ /* Before HFI_CTRL_INIT: a6xx_gmu_gfx_rail_on + a6xx_sptprac_enable. */
+ static int
+ sweet_gpu_rail_on(vm_offset_t gmu)
+@@ -1186,8 +1334,8 @@ sweet_gpu_power_up(vm_offset_t gmu)
+ 	    st, irq, back == 0x5eedc0deu ? "OK" : "FAILED", back);
+ 	int level = 0;
+ 	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
+-	if (level >= 5 && back == 0x5eedc0deu) {
+-		sweet_gpu_zap();
++	if (level >= 5 && back == 0x5eedc0deu && sweet_gpu_zap() == 0 && level >= 6) {
++		sweet_gpu_cp_test(g, gmu);
+ 	}
+ }
+ 
