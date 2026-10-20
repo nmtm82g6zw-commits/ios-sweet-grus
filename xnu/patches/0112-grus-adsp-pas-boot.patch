@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 53b3f7b..352f162 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,7 @@ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static void sweet_cpufreq_start(void);
+ static void sweet_smem_probe(void);
++static void sweet_adsp_thread(void *arg, wait_result_t wr);
+ static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ static void sweet_gpu_late_thread(void *arg, wait_result_t wr);
+ static struct { vm_offset_t gcc, cc, gmu; } sweet_gpu_late;
+@@ -1489,6 +1490,157 @@ sweet_gpu_blit(const struct sweet_blit *b, unsigned n)
+ #undef GR
+ #undef GWR
+ 
++/*
++ * Remote processors, step 1 (sweetadsp=1): boot the audio DSP (LPASS
++ * Hexagon) through TrustZone, like the zap shader. grus stock DTB:
++ * qcom,lpass@62400000 pil-tz-generic, pas-id 1, firmware "adsp",
++ * memory-region pil_adsp_region@93e00000 size 0x2200000. adsp.mdt: 30
++ * relocatable PT_LOAD segments, paddr 0x93d00000..0x95f00000 (exactly the
++ * region size), hash in segment 1. Firmware from ADT /sweet-rproc adsp-mdt
++ * / adsp-bNN (tools/adt-add-gpu-fw.py --rproc adsp=PREFIX, local only).
++ * Not done (downstream proxy votes / qcom,signal-aop): CX/XO proxy votes
++ * and the AOP "load_state" message; added if the DSP does not come up.
++ * Afterwards the apps<->ADSP SMEM partition (hosts 0<->2, 0x1cf000) is
++ * listed: GLINK items there mean the DSP is running.
++ */
++static uint8_t sweet_rproc_meta[0x4000] __attribute__((aligned(0x1000)));
++
++static int
++sweet_pas_boot(const char *name, uint32_t pas, uint32_t mem_pa, uint32_t mem_size)
++{
++	DTEntry node;
++	char prop[16];
++	void const *mdt = NULL;
++	unsigned int mdt_size = 0;
++	snprintf(prop, sizeof(prop), "%s-mdt", name);
++	if (SecureDTLookupEntry(NULL, "/sweet-rproc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, prop, &mdt, &mdt_size) != kSuccess ||
++	    mdt_size < 52 || mdt_size > sizeof(sweet_rproc_meta)) {
++		printf("SWEET PAS: no %s in the ADT (size %u)\n", prop, mdt_size);
++		return -1;
++	}
++	const uint8_t *e = mdt;
++	uint32_t phoff = *(const uint32_t *)(e + 28);
++	unsigned phent = *(const uint16_t *)(e + 42), phnum = *(const uint16_t *)(e + 44);
++	if (e[4] != 1 || phent != 32 || phnum > 64 || phoff + phent * phnum > mdt_size) {
++		printf("SWEET PAS: %s: unexpected mdt header\n", name);
++		return -1;
++	}
++	uint32_t min = ~0u, max = 0;
++	int reloc = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + i * 32);
++		if (ph[0] != 1 || ph[5] == 0 || ((ph[6] >> 24) & 7u) == 2) {
++			continue;
++		}
++		min = ph[3] < min ? ph[3] : min;
++		max = ph[3] + ph[5] > max ? ph[3] + ph[5] : max;
++		reloc |= (int)((ph[6] >> 27) & 1u);
++	}
++	max = (max + 0xfffu) & ~0xfffu;
++	if (min == ~0u || max - min > mem_size || (!reloc && min != mem_pa)) {
++		printf("SWEET PAS: %s segments 0x%x-0x%x reloc %d do not fit 0x%x+0x%x\n", name, min, max,
++		    reloc, mem_pa, mem_size);
++		return -1;
++	}
++	bzero(sweet_rproc_meta, sizeof(sweet_rproc_meta));
++	bcopy(mdt, sweet_rproc_meta, mdt_size);
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_rproc_meta, sizeof(sweet_rproc_meta));
++	uint64_t meta_pa = ml_static_vtop((vm_offset_t)sweet_rproc_meta);
++	uint64_t rc = sweet_scm(1, 2u | (2u << 6), pas, meta_pa, 0, NULL);
++	GPU_STEP("SWEET PAS: %s PAS_INIT_IMAGE(%u, %u bytes) -> ret %lld\n", name, pas, mdt_size, (long long)rc);
++	if (rc != 0) {
++		return -1;
++	}
++	rc = sweet_scm(2, 3, pas, mem_pa, max - min, NULL);
++	GPU_STEP("SWEET PAS: %s PAS_MEM_SETUP(0x%x, 0x%x) -> ret %lld\n", name, mem_pa, max - min, (long long)rc);
++	if (rc != 0) {
++		return -1;
++	}
++	vm_offset_t mem = ml_io_map(mem_pa, mem_size);
++	if (mem == 0) {
++		return -1;
++	}
++	uint32_t loaded = 0, nseg = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + i * 32);
++		if (ph[0] != 1 || ph[5] == 0 || ((ph[6] >> 24) & 7u) == 2) {
++			continue;
++		}
++		void const *seg = NULL;
++		unsigned int seg_size = 0;
++		snprintf(prop, sizeof(prop), "%s-b%02u", name, i);
++		if (ph[4] != 0 && (SecureDTGetProperty(node, prop, &seg, &seg_size) != kSuccess || seg_size < ph[4])) {
++			printf("SWEET PAS: segment %s missing (%u < %u)\n", prop, seg_size, ph[4]);
++			return -1;
++		}
++		uint32_t off = (reloc ? ph[3] - min : ph[3] - mem_pa);
++		for (uint32_t k = 0; k < ph[5]; k += 4) {
++			uint32_t w = 0;
++			if (k < ph[4]) {
++				bcopy((const uint8_t *)seg + k, &w, ph[4] - k >= 4 ? 4 : ph[4] - k);
++			}
++			*(volatile uint32_t *)(mem + off + k) = w;
++		}
++		loaded += ph[4];
++		nseg++;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	GPU_STEP("SWEET PAS: %s %u segments, %u bytes loaded at 0x%x\n", name, nseg, loaded, mem_pa);
++	rc = sweet_scm(5, 1, pas, 0, 0, NULL);
++	GPU_STEP("SWEET PAS: %s PAS_AUTH_AND_RESET(%u) -> ret %lld%s\n", name, pas, (long long)rc,
++	    rc == 0 ? ": processor released from reset" : "");
++	return rc == 0 ? 0 : -1;
++}
++
++/* Items in an SMEM partition (Linux smem.c private entries), read-only. */
++static void
++sweet_smem_list(uint32_t part_off, uint32_t part_size, const char *what)
++{
++	vm_offset_t m = ml_io_map(0x86000000 + part_off, part_size);
++	if (m == 0) {
++		return;
++	}
++	if (usb_rd(m, 0) != 0x54525024u) {     /* "$PRT" */
++		printf("SWEET SMEM: %s: no partition header (0x%08x)\n", what, usb_rd(m, 0));
++		return;
++	}
++	uint32_t hosts = usb_rd(m, 4), free_unc = usb_rd(m, 12), free_cached = usb_rd(m, 16);
++	char line[200];
++	int o = snprintf(line, sizeof(line), "SWEET SMEM: %s hosts %u<->%u used 0x%x cached-from 0x%x items:",
++	    what, hosts & 0xffffu, hosts >> 16, free_unc, free_cached);
++	uint32_t p = 32;
++	for (int n = 0; n < 40 && p + 16 <= free_unc && free_unc <= part_size; n++) {
++		uint32_t h0 = usb_rd(m, p), size = usb_rd(m, p + 4), pad = usb_rd(m, p + 8);
++		if ((h0 & 0xffffu) != 0xa5a5u) {
++			o += snprintf(line + o, sizeof(line) - (size_t)o, " (bad canary 0x%x)", h0);
++			break;
++		}
++		if (o < 180) {
++			o += snprintf(line + o, sizeof(line) - (size_t)o, " %u", h0 >> 16);
++		}
++		p += 16 + (pad >> 16) + size;
++	}
++	printf("%s\n", line);
++}
++
++static void
++sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	ud_sleep_ms(60000);
++	printf("SWEET ADSP: boot starting\n");
++	sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp before");
++	if (sweet_pas_boot("adsp", 1, 0x93e00000u, 0x2200000u) == 0) {
++		for (int t = 0; t < 3; t++) {
++			ud_sleep_ms(2000);
++			sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp");
++		}
++	}
++	printf("SWEET ADSP: done\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /* Before HFI_CTRL_INIT: a6xx_gmu_gfx_rail_on + a6xx_sptprac_enable. */
+ static int
+ sweet_gpu_rail_on(vm_offset_t gmu)
+@@ -1932,6 +2084,11 @@ sweet_cpufreq_start(void)
+ 	sweet_cpufreq_set();
+ 	sweet_gpu_probe();
+ 	sweet_smem_probe();
++	int adsp = 0;
++	PE_parse_boot_argn("sweetadsp", &adsp, sizeof(adsp));
++	if (adsp && kernel_thread_start(sweet_adsp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
+ 	if (on && kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
