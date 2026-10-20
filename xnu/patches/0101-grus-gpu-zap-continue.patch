@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9d7770e..19e97aa 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -928,11 +928,11 @@ sweet_gmu_oob(vm_offset_t gmu, unsigned set, unsigned ack, const char *name)
+ static uint8_t sweet_zap_meta[0x2000] __attribute__((aligned(0x1000)));
+ 
+ static uint64_t
+-sweet_scm(uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *r1)
++sweet_scm_svc(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *r1)
+ {
+ 	uint64_t ret = 0, res1 = 0;
+ 	for (int tries = 0; tries < 50; tries++) {
+-		register uint64_t x0 __asm__("x0") = 0x42000200ull | cmd;    /* STD, SMC64, SIP, svc 2 */
++		register uint64_t x0 __asm__("x0") = 0x42000000ull | (svc << 8) | cmd;   /* STD, SMC64, SIP */
+ 		register uint64_t x1 __asm__("x1") = arginfo;
+ 		register uint64_t x2 __asm__("x2") = a0;
+ 		register uint64_t x3 __asm__("x3") = a1;
+@@ -955,6 +955,13 @@ sweet_scm(uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
+ 	return ret;
+ }
+ 
++/* PIL service (svc 2). */
++static uint64_t
++sweet_scm(uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *r1)
++{
++	return sweet_scm_svc(2, cmd, arginfo, a0, a1, a2, r1);
++}
++
+ static void
+ sweet_gpu_zap(void)
+ {
+@@ -974,12 +981,23 @@ sweet_gpu_zap(void)
+ 		printf("SWEET ZAP: unexpected mdt header\n");
+ 		return;
+ 	}
+-	uint64_t r1 = 0, rc = sweet_scm(7, 1, ZAP_PAS, 0, 0, &r1);
+-	GPU_STEP("SWEET ZAP: PAS_IS_SUPPORTED(%u) -> ret %lld supported %llu\n", ZAP_PAS, (long long)rc,
+-	    (unsigned long long)r1);
+-	if (rc != 0 || r1 == 0) {
+-		return;
++	/*
++	 * 0100: PAS_IS_SUPPORTED(13) returned 0 with supported = 0. Check the
++	 * calling convention first: INFO (svc 6) IS_CALL_AVAIL (cmd 1) for each
++	 * PIL command, argument = SIP owner | (svc << 8) | cmd (ARM_64 form, as
++	 * __qcom_scm_is_call_available). IS_SUPPORTED is only logged now;
++	 * downstream pil-tz-generic never asks it, TZ refuses INIT_IMAGE itself.
++	 */
++	static const uint32_t pil_cmds[4] = { 1, 2, 5, 7 };
++	for (unsigned i = 0; i < 4; i++) {
++		uint64_t avail = 0;
++		uint64_t arc = sweet_scm_svc(6, 1, 1, 0x02000000ull | (2u << 8) | pil_cmds[i], 0, 0, &avail);
++		printf("SWEET ZAP: IS_CALL_AVAIL(PIL %u) -> ret %lld avail %llu\n", pil_cmds[i],
++		    (long long)arc, (unsigned long long)avail);
+ 	}
++	uint64_t r1 = 0, rc = sweet_scm(7, 1, ZAP_PAS, 0, 0, &r1);
++	GPU_STEP("SWEET ZAP: PAS_IS_SUPPORTED(%u) -> ret %lld supported %llu (continuing)\n", ZAP_PAS,
++	    (long long)rc, (unsigned long long)r1);
+ 	/* Loadable segments: PT_LOAD, memsz != 0, not the hash segment (type 2 in flags 26:24). */
+ 	uint32_t min = ~0u, max = 0;
+ 	int reloc = 0;
