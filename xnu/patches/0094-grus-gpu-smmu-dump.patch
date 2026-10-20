@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0fb84df..ad84e18 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -45,6 +45,7 @@ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static void sweet_cpufreq_start(void);
+ static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ static void sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu);
++static void sweet_gpu_smmu_dump(void);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -504,6 +505,45 @@ sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc)
+ 	}
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 4a: read-only dump of the GPU SMMU (kgsl_smmu,
++ * ARM SMMUv2 at 0x05040000, 4 KiB register pages; grus sdm670-gpu.dtsi
++ * stream IDs: GPU user 0, alt 1, secure 2, GMU user 4, GMU kernel 5).
++ * 0093 showed sCR0 0x00200626 (translation on, unmatched streams fault),
++ * 5 stream-match groups, 5 context banks: before giving the GMU a page
++ * table, see what ABL/TZ already programmed. GR0: SMR 0x800, S2CR 0xc00;
++ * GR1 (+0x1000): CBAR, CBA2R 0x800; context bank n at +0x8000 + n * 0x1000
++ * (IDR1 NUMPAGENDXB 2 -> 8 global pages).
++ */
++static void
++sweet_gpu_smmu_dump(void)
++{
++	vm_offset_t s = ml_io_map(0x05040000, 0x10000);
++	if (s == 0) {
++		return;
++	}
++	uint32_t idr1 = usb_rd(s, 0x24);
++	unsigned nsmr = usb_rd(s, 0x20) & 0xffu, ncb = idr1 & 0xffu;
++	unsigned gpages = 1u << (((idr1 >> 28) & 7u) + 1);
++	printf("SWEET SMMU: sCR0 0x%08x IDR2 0x%08x sGFSR 0x%08x sGFSYNR0 0x%08x sGFAR 0x%08x%08x; %u SMR, %u CB, CB base +0x%x\n",
++	    usb_rd(s, 0x0), usb_rd(s, 0x28), usb_rd(s, 0x48), usb_rd(s, 0x50),
++	    usb_rd(s, 0x44), usb_rd(s, 0x40), nsmr, ncb, gpages * 0x1000u);
++	for (unsigned i = 0; i < nsmr && i < 16; i++) {
++		printf("SWEET SMMU: SMR%u 0x%08x S2CR%u 0x%08x\n", i, usb_rd(s, 0x800 + 4 * i),
++		    i, usb_rd(s, 0xc00 + 4 * i));
++	}
++	for (unsigned i = 0; i < ncb && i < 16; i++) {
++		vm_offset_t cb = s + gpages * 0x1000u + i * 0x1000u;
++		if (gpages * 0x1000u + (i + 1) * 0x1000u > 0x10000) {
++			break;
++		}
++		printf("SWEET SMMU: CB%u CBAR 0x%08x CBA2R 0x%08x SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%08x%08x MAIR0 0x%08x FSR 0x%08x\n",
++		    i, usb_rd(s, 0x1000 + 4 * i), usb_rd(s, 0x1800 + 4 * i), usb_rd(cb, 0x0),
++		    usb_rd(cb, 0x30), usb_rd(cb, 0x10), usb_rd(cb, 0x24), usb_rd(cb, 0x20),
++		    usb_rd(cb, 0x38), usb_rd(cb, 0x58));
++	}
++}
++
+ /*
+  * Adreno 616 bring-up, step 3 (sweetgpu=2): boot the GMU firmware, following
+  * Linux a6xx_gmu.c for the a630 family ("legacy" GMU, a615 chip id
+@@ -658,6 +698,7 @@ sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu)
+ 	if ((res & mask) != want) {
+ 		GW(0x5000, 1);                     /* stop the CM3 again */
+ 	}
++	sweet_gpu_smmu_dump();
+ #undef PW
+ #undef G
+ #undef GW
