@@ -1,0 +1,88 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 37233dc..d8f52c9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -210,7 +210,8 @@ public:
+ 	IOLock        *fJobLock;
+ 	uint32_t      fJobGen, fJobPending, fJobThreads;
+ 	static void bilinearWorker(void *arg, wait_result_t wr);
+-	void bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1);
++	void bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1, uint32_t *tmp);
++	uint32_t      *fRowBuf;                 /* one cached row per thread */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -448,7 +449,16 @@ AppleCLCD::start(IOService *provider)
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fScale ? (fFilter ? "scaled to the panel, bilinear" : "scaled to the panel, nearest") : "centered");
+ 	if (fFilter) {
+-		IOLog("SWEET FB: bilinear on %u threads\n", fJobThreads);
++		/*
++		 * 0106 still took 22 ms per frame on 4 threads: single 32-bit
++		 * stores into the uncached panel memory are the bottleneck (the
++		 * plain memcpy of the same 10 MB takes 4.5 ms). Each row is built
++		 * in a cached per-thread buffer and copied to the panel in one
++		 * memcpy.
++		 */
++		fRowBuf = (uint32_t *)IOMalloc((vm_size_t)fJobThreads * fWidth * 4);
++		IOLog("SWEET FB: bilinear on %u threads, row buffers %s\n", fJobThreads,
++		    fRowBuf != NULL ? "on" : "off");
+ 	}
+ 	return true;
+ }
+@@ -762,7 +772,7 @@ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
+  * are clamped to its edge (no bleeding between layers).
+  */
+ void
+-AppleCLCD::bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1)
++AppleCLCD::bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1, uint32_t *tmp)
+ {
+ 	int32_t xmax = j.dx + j.w - 1, ymax = j.dy + j.h - 1;
+ 	for (uint32_t py = py0; py < py1; py++) {
+@@ -777,6 +787,7 @@ AppleCLCD::bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1)
+ 		const uint32_t *r1 = (const uint32_t *)(j.base + (uint64_t)(j.sy + y1 - j.dy) * j.s->bytesPerRow) + j.sx - j.dx;
+ 		uint32_t wy = fYW[py];
+ 		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		uint32_t *out = tmp != NULL ? tmp : drow;
+ 		for (uint32_t px = j.px0; px < j.px1; px++) {
+ 			int32_t x0 = fX0[px], x1 = x0 + 1;
+ 			x0 = x0 < j.dx ? j.dx : (x0 > xmax ? xmax : x0);
+@@ -784,7 +795,10 @@ AppleCLCD::bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1)
+ 			uint32_t wx = fXW[px];
+ 			uint32_t top = sweet_lerp(r0[x0], r0[x1], wx);
+ 			uint32_t bot = sweet_lerp(r1[x0], r1[x1], wx);
+-			drow[px] = sweet_lerp(top, bot, wy);
++			out[px] = sweet_lerp(top, bot, wy);
++		}
++		if (tmp != NULL) {
++			memcpy(drow + j.px0, tmp + j.px0, (size_t)(j.px1 - j.px0) * 4);
+ 		}
+ 	}
+ }
+@@ -809,7 +823,7 @@ AppleCLCD::bilinearWorker(void *arg, wait_result_t wr __unused)
+ 		uint32_t py0 = index * band, py1 = py0 + band;
+ 		py1 = py1 > fb->fHeight ? fb->fHeight : py1;
+ 		if (py0 < py1) {
+-			fb->bilinearRows(j, py0, py1);
++			fb->bilinearRows(j, py0, py1, fb->fRowBuf ? fb->fRowBuf + (size_t)index * fb->fWidth : NULL);
+ 		}
+ 		IOLockLock(fb->fJobLock);
+ 		if (--fb->fJobPending == 0) {
+@@ -829,7 +843,7 @@ AppleCLCD::presentBilinear(SweetSurface *s, const uint8_t *base, int32_t sx, int
+ {
+ 	BilinearJob j = { s, base, sx, sy, dx, dy, w, h, px0, px1 };
+ 	if (fJobThreads <= 1) {
+-		bilinearRows(j, 0, fHeight);
++		bilinearRows(j, 0, fHeight, fRowBuf);
+ 		return;
+ 	}
+ 	IOLockLock(fJobLock);
+@@ -839,7 +853,7 @@ AppleCLCD::presentBilinear(SweetSurface *s, const uint8_t *base, int32_t sx, int
+ 	IOLockWakeup(fJobLock, &fJobGen, false);
+ 	uint32_t band = (fHeight + fJobThreads - 1) / fJobThreads;
+ 	IOLockUnlock(fJobLock);
+-	bilinearRows(j, 0, band < fHeight ? band : fHeight);
++	bilinearRows(j, 0, band < fHeight ? band : fHeight, fRowBuf);
+ 	IOLockLock(fJobLock);
+ 	while (fJobPending != 0) {
+ 		IOLockSleep(fJobLock, &fJobPending, THREAD_UNINT);
