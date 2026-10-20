@@ -1,0 +1,138 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3ad9f17..6adb7b7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -190,6 +190,9 @@ public:
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	bool          fScale;                   /* scale the logical display onto the panel */
+ 	uint16_t      *fXMap, *fYMap;           /* panel pixel -> logical pixel */
++	bool          fFilter;                  /* bilinear instead of nearest */
++	uint16_t      *fX0, *fY0;               /* bilinear: left/top logical pixel */
++	uint8_t       *fXW, *fYW;               /* bilinear: weight of the right/bottom one */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -209,6 +212,8 @@ public:
+ 	void present(const uint8_t *rec);
+ 	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
++	void presentBilinear(SweetSurface *s, const uint8_t *base, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h, uint32_t px0, uint32_t px1);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -328,6 +333,44 @@ AppleCLCD::start(IOService *provider)
+ 			fOffX = fOffY = 0;
+ 		}
+ 	}
++	/*
++	 * Nearest neighbour at 0.96 drops one row/column in 25, which shows as
++	 * jagged edges and text. Bilinear (default, sweetfb_filter=0 for
++	 * nearest): each panel pixel blends the 2x2 logical pixels around its
++	 * centre, weights in 1/256, two channels per multiply.
++	 */
++	int filter = 1;
++	PE_parse_boot_argn("sweetfb_filter", &filter, sizeof(filter));
++	fFilter = false;
++	if (fScale && filter != 0) {
++		fX0 = (uint16_t *)IOMalloc(fWidth * sizeof(uint16_t));
++		fY0 = (uint16_t *)IOMalloc(fHeight * sizeof(uint16_t));
++		fXW = (uint8_t *)IOMalloc(fWidth);
++		fYW = (uint8_t *)IOMalloc(fHeight);
++		if (fX0 != NULL && fY0 != NULL && fXW != NULL && fYW != NULL) {
++			for (uint32_t i = 0; i < fWidth; i++) {
++				int64_t pos = (int64_t)(((2 * (uint64_t)i + 1) * fLogicalW * 256) / (2 * fWidth)) - 128;
++				pos = pos < 0 ? 0 : pos;
++				fX0[i] = (uint16_t)(pos >> 8);
++				fXW[i] = (uint8_t)(pos & 255);
++				if (fX0[i] >= fLogicalW - 1) {
++					fX0[i] = (uint16_t)(fLogicalW - 2);
++					fXW[i] = 255;
++				}
++			}
++			for (uint32_t i = 0; i < fHeight; i++) {
++				int64_t pos = (int64_t)(((2 * (uint64_t)i + 1) * fLogicalH * 256) / (2 * fHeight)) - 128;
++				pos = pos < 0 ? 0 : pos;
++				fY0[i] = (uint16_t)(pos >> 8);
++				fYW[i] = (uint8_t)(pos & 255);
++				if (fY0[i] >= fLogicalH - 1) {
++					fY0[i] = (uint16_t)(fLogicalH - 2);
++					fYW[i] = 255;
++				}
++			}
++			fFilter = true;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -358,7 +401,7 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u (%s)\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fScale ? "scaled to the panel" : "centered");
++	    fScale ? (fFilter ? "scaled to the panel, bilinear" : "scaled to the panel, nearest") : "centered");
+ 	return true;
+ }
+ 
+@@ -640,6 +683,10 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 		return;
+ 	}
+ 	const uint8_t *base = (const uint8_t *)src + s->offset;
++	if (fFilter) {
++		presentBilinear(s, base, sx, sy, dx, dy, w, h, px0, px1);
++		return;
++	}
+ 	for (uint32_t py = 0; py < fHeight; py++) {
+ 		uint32_t ly = fYMap[py];
+ 		if (ly < (uint32_t)dy || ly >= (uint32_t)(dy + h)) {
+@@ -653,6 +700,49 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	}
+ }
+ 
++static inline uint32_t
++sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
++{
++	uint32_t iw = 256 - w;
++	uint32_t rb = (((a & 0x00ff00ffu) * iw + (b & 0x00ff00ffu) * w) >> 8) & 0x00ff00ffu;
++	uint32_t ga = ((((a >> 8) & 0x00ff00ffu) * iw + ((b >> 8) & 0x00ff00ffu) * w)) & 0xff00ff00u;
++	return rb | ga;
++}
++
++/*
++ * Bilinear version of presentScaled: logical pixels outside the layer rect
++ * are clamped to its edge (no bleeding between layers).
++ */
++void
++AppleCLCD::presentBilinear(SweetSurface *s, const uint8_t *base, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h, uint32_t px0, uint32_t px1)
++{
++	(void)s;
++	int32_t xmax = dx + w - 1, ymax = dy + h - 1;
++	for (uint32_t py = 0; py < fHeight; py++) {
++		uint32_t ly = fYMap[py];
++		if (ly < (uint32_t)dy || ly >= (uint32_t)(dy + h)) {
++			continue;
++		}
++		int32_t y0 = fY0[py], y1 = y0 + 1;
++		y0 = y0 < dy ? dy : (y0 > ymax ? ymax : y0);
++		y1 = y1 < dy ? dy : (y1 > ymax ? ymax : y1);
++		const uint32_t *r0 = (const uint32_t *)(base + (uint64_t)(sy + y0 - dy) * s->bytesPerRow) + sx - dx;
++		const uint32_t *r1 = (const uint32_t *)(base + (uint64_t)(sy + y1 - dy) * s->bytesPerRow) + sx - dx;
++		uint32_t wy = fYW[py];
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		for (uint32_t px = px0; px < px1; px++) {
++			int32_t x0 = fX0[px], x1 = x0 + 1;
++			x0 = x0 < dx ? dx : (x0 > xmax ? xmax : x0);
++			x1 = x1 < dx ? dx : (x1 > xmax ? xmax : x1);
++			uint32_t wx = fXW[px];
++			uint32_t top = sweet_lerp(r0[x0], r0[x1], wx);
++			uint32_t bot = sweet_lerp(r1[x0], r1[x1], wx);
++			drow[px] = sweet_lerp(top, bot, wy);
++		}
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
