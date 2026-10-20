@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a662a62..37d56cf 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -43,6 +43,19 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* osfmk/arm/machine_routines.h declares these only for PEXPERT/MACH_KERNEL_PRIVATE */
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++/*
++ * io_map returns base + (phys & PAGE_MASK) for a physical address that is
++ * not 16 KiB aligned, but ml_io_unmap hands its range straight to
++ * pmap_remove, which panics on an unaligned range (0114: the SMEM
++ * apps<->adsp partition at +0x1cf000). Unmap the whole pages.
++ */
++static void
++sweet_io_unmap(vm_offset_t va, vm_size_t size)
++{
++	vm_offset_t start = va & ~(vm_offset_t)PAGE_MASK;
++	vm_offset_t end = (va + size + PAGE_MASK) & ~(vm_offset_t)PAGE_MASK;
++	ml_io_unmap(start, end - start);
++}
+ #ifndef VM_WIMG_IO
+ #define VM_WIMG_IO 0x7                  /* osfmk/arm/memory_types.h */
+ #endif
+@@ -1584,7 +1597,7 @@ sweet_pas_boot(const char *name, uint32_t pas, uint32_t mem_pa, uint32_t mem_siz
+ 		snprintf(prop, sizeof(prop), "%s-b%02u", name, i);
+ 		if (ph[4] != 0 && (SecureDTGetProperty(node, prop, &seg, &seg_size) != kSuccess || seg_size < ph[4])) {
+ 			printf("SWEET PAS: segment %s missing (%u < %u)\n", prop, seg_size, ph[4]);
+-			ml_io_unmap(mem, mem_size);
++			sweet_io_unmap(mem, mem_size);
+ 			return -1;
+ 		}
+ 		uint32_t off = (reloc ? ph[3] - min : ph[3] - mem_pa);
+@@ -1599,7 +1612,7 @@ sweet_pas_boot(const char *name, uint32_t pas, uint32_t mem_pa, uint32_t mem_siz
+ 		nseg++;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	ml_io_unmap(mem, mem_size);
++	sweet_io_unmap(mem, mem_size);
+ 	GPU_STEP("SWEET PAS: %s %u segments, %u bytes loaded at 0x%x\n", name, nseg, loaded, mem_pa);
+ 	rc = sweet_scm(5, 1, pas, 0, 0, NULL);
+ 	GPU_STEP("SWEET PAS: %s PAS_AUTH_AND_RESET(%u) -> ret %lld%s\n", name, pas, (long long)rc,
+@@ -1617,7 +1630,7 @@ sweet_smem_list(uint32_t part_off, uint32_t part_size, const char *what)
+ 	}
+ 	if (usb_rd(m, 0) != 0x54525024u) {     /* "$PRT" */
+ 		printf("SWEET SMEM: %s: no partition header (0x%08x)\n", what, usb_rd(m, 0));
+-		ml_io_unmap(m, part_size);
++		sweet_io_unmap(m, part_size);
+ 		return;
+ 	}
+ 	uint32_t hosts = usb_rd(m, 4), free_unc = usb_rd(m, 12), free_cached = usb_rd(m, 16);
+@@ -1637,7 +1650,7 @@ sweet_smem_list(uint32_t part_off, uint32_t part_size, const char *what)
+ 		p += 16 + (pad >> 16) + size;
+ 	}
+ 	printf("%s\n", line);
+-	ml_io_unmap(m, part_size);
++	sweet_io_unmap(m, part_size);
+ }
+ 
+ static void
