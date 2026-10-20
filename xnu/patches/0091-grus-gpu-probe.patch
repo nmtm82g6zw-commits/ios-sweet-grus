@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 5ae1aaa..93168d5 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -416,12 +416,47 @@ sweet_cpufreq_set(void)
+ #endif /* SWEET_BOARD_GRUS: sweet's cpufreq block is not mapped here */
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 1: read-only state probe (like the USB probe).
++ * grus-p-oss sdm670-gpu.dtsi / msm-gdsc-sdm845.dtsi / gcc-sdm845.c /
++ * gpucc-sdm845.c: GCC gpu_cfg_ahb 0x71004 (gates the GPU_CC registers),
++ * ddrss_gpu_axi 0x44038, gpu_memnoc_gfx 0x7100c; GPU_CC at 0x5090000:
++ * CX GDSCR 0x106c, GX GDSCR 0x100c, cx_gmu 0x1098, cxo 0x109c,
++ * gx_gfx3d 0x1054. GPU_CC is only read when its AHB clock is on (a read
++ * of a gated block hangs the bus). Nothing is written.
++ */
++static void
++sweet_gpu_probe(void)
++{
++#if defined(SWEET_BOARD_GRUS)
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		return;
++	}
++	uint32_t ahb = usb_rd(gcc, 0x71004), axi = usb_rd(gcc, 0x44038), noc = usb_rd(gcc, 0x7100c);
++	printf("SWEET GPU: GCC gpu_cfg_ahb 0x%08x (%s) ddrss_gpu_axi 0x%08x memnoc_gfx 0x%08x\n",
++	    ahb, (ahb & CBCR_CLK_OFF) ? "off" : "on", axi, noc);
++	if (ahb & CBCR_CLK_OFF) {
++		printf("SWEET GPU: GPU_CC AHB clock off: GPU_CC not read (GPU unpowered, as expected)\n");
++		return;
++	}
++	vm_offset_t cc = ml_io_map(0x05090000, 0x9000);
++	if (cc == 0) {
++		return;
++	}
++	printf("SWEET GPU: CX GDSC 0x%08x GX GDSC 0x%08x cx_gmu 0x%08x cxo 0x%08x gx_gfx3d 0x%08x\n",
++	    usb_rd(cc, 0x106c), usb_rd(cc, 0x100c), usb_rd(cc, 0x1098), usb_rd(cc, 0x109c),
++	    usb_rd(cc, 0x1054));
++#endif
++}
++
+ static void
+ sweet_cpufreq_start(void)
+ {
+ 	int on = 1;
+ 	thread_t thread;
+ 	sweet_cpufreq_set();
++	sweet_gpu_probe();
+ 	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
+ 	if (on && kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
