@@ -1,0 +1,69 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 416b2e4..fda60d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -360,7 +360,34 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		/*
++		 * Display path cost (bring-up for a zero-copy MDP scan-out): time
++		 * spent in the CPU copy, logged every ~10 s as frames, average and
++		 * maximum microseconds per frame and share of one CPU.
++		 */
++		static uint64_t st_win, st_busy, st_max;
++		static uint32_t st_frames;
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		uint64_t t1 = mach_absolute_time();
++		if (st_win == 0) {
++			st_win = t0;
++		}
++		st_busy += t1 - t0;
++		st_max = (t1 - t0) > st_max ? (t1 - t0) : st_max;
++		st_frames++;
++		uint64_t win_ns, busy_ns, max_ns;
++		absolutetime_to_nanoseconds(t1 - st_win, &win_ns);
++		if (win_ns >= 10000000000ULL) {
++			absolutetime_to_nanoseconds(st_busy, &busy_ns);
++			absolutetime_to_nanoseconds(st_max, &max_ns);
++			IOLog("SWEET FB: present %u frames in %llu ms, avg %llu us, max %llu us, %llu.%llu%% of one CPU\n",
++			    st_frames, win_ns / 1000000ULL, busy_ns / 1000ULL / st_frames, max_ns / 1000ULL,
++			    busy_ns * 100ULL / win_ns, (busy_ns * 1000ULL / win_ns) % 10ULL);
++			st_win = t1;
++			st_busy = st_max = 0;
++			st_frames = 0;
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ #if SWEET_PANEL_CMD_MODE
+ 		sweet_mdp_kick();
+@@ -446,6 +473,29 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
++		/* Once per surface id (first 16): is it physically contiguous? (zero-copy scan-out) */
++		static uint32_t contig_logged[16];
++		if (s != NULL && s->memory != NULL) {
++			bool seen = false;
++			unsigned slot = 16;
++			for (unsigned i = 0; i < 16; i++) {
++				if (contig_logged[i] == id) {
++					seen = true;
++				}
++				if (contig_logged[i] == 0 && slot == 16) {
++					slot = i;
++				}
++			}
++			if (!seen && slot < 16) {
++				contig_logged[slot] = id;
++				IOByteCount seg = 0;
++				addr64_t pa = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
++				IOLog("SWEET FB: surface %u %ux%u bpr %u len %llu phys %#llx first segment %llu (%s)\n",
++				    id, s->width, s->height, s->bytesPerRow, (unsigned long long)s->memory->getLength(),
++				    (unsigned long long)pa, (unsigned long long)seg,
++				    seg >= (uint64_t)s->bytesPerRow * s->height ? "contiguous" : "scattered");
++			}
++		}
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
