@@ -1,0 +1,440 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 88caef2..30a8ea5 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -54,6 +54,7 @@ static void sweet_gpu_smmu_dump(void);
+ static int sweet_gpu_smmu_map(void);
+ static int sweet_gpu_zap(void);
+ static void sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu);
++static void sweet_gpu_blit_setup(vm_offset_t g, uint32_t w);
+ static void sweet_hfi_start(vm_offset_t gmu);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -1240,6 +1241,214 @@ sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu)
+ 	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA + 0x9000, 0x1000);
+ 	GPU_STEP("SWEET CP: target word 0x%08x -> %s\n", dst[0],
+ 	    dst[0] == 0x00c0ffeeu ? "THE GPU EXECUTED OUR COMMAND" : "not written");
++	if (dst[0] == 0x00c0ffeeu) {
++		sweet_gpu_blit_setup(g, w);
++	}
++}
++
++/*
++ * Display blits on the Adreno 2D engine (sweetfb_gpu, default on once the
++ * GPU is up), the register sequence of turnip's r2d path (tu_clear_blit.cc
++ * r2d_setup_common / r2d_coords / r2d_src_buffer / r2d_dst_buffer /
++ * r2d_run, Mesa 25.2) with a615 values from freedreno_devices.py
++ * (RB_DBG_ECO_CNTL 0x04100000, one CCU: sysmem colour cache at 64 KiB).
++ * GPU address window 0x70000000-0x75ffffff: 48 extra L3 tables under the
++ * existing L2 (context bank 0, SIDs 0/1): +0 panel, +16 MiB intermediate
++ * buffer, +32 MiB four 16 MiB surface slots. SweetFramebuffer.cpp maps
++ * pages (sweet_gpu_map) and submits blit lists (sweet_gpu_blit); this side
++ * writes them into the ring, ends with a CCU flush and a CACHE_FLUSH_TS
++ * fence and polls the fence.
++ */
++#define SWEET_GPU_WIN 0x70000000u
++#define SWEET_GPU_WIN_TABLES 48u
++static uint64_t sweet_gpu_l3x[SWEET_GPU_WIN_TABLES * 512] __attribute__((aligned(0x1000)));
++static struct {
++	vm_offset_t g, smmu;
++	uint32_t w, seq;
++	int ready;
++} sweet_g2d;
++
++struct sweet_blit {
++	uint32_t src_va, src_pitch, src_w, src_h;
++	int32_t sx0, sy0, sx1, sy1;            /* inclusive */
++	uint32_t dst_va, dst_pitch;
++	int32_t dx0, dy0, dx1, dy1;            /* inclusive */
++	int filter;
++};
++int sweet_gpu_ready(void);
++int sweet_gpu_map(uint32_t va, const uint64_t *pa4k, uint32_t n);
++int sweet_gpu_blit(const struct sweet_blit *b, unsigned n);
++
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (pm4_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (pm4_parity(reg) << 27);
++}
++
++static inline void
++ring_put(uint32_t v)
++{
++	uint32_t *ring = (uint32_t *)(GPU_DATA + 0x8000);
++	ring[sweet_g2d.w] = v;
++	sweet_g2d.w = (sweet_g2d.w + 1) & 0x3ffu;
++}
++
++static void
++ring_reg(uint32_t reg, uint32_t v)
++{
++	ring_put(pkt4(reg, 1));
++	ring_put(v);
++}
++
++static void
++ring_event(uint32_t ev)
++{
++	ring_put(pkt7(0x46, 1));               /* CP_EVENT_WRITE */
++	ring_put(ev);
++}
++
++static void
++ring_event_ts(uint32_t ev, uint32_t va, uint32_t val)
++{
++	ring_put(pkt7(0x46, 4));
++	ring_put(ev);
++	ring_put(va);
++	ring_put(0);
++	ring_put(val);
++}
++
++static void
++sweet_gpu_blit_setup(vm_offset_t g, uint32_t w)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetfb_gpu", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	uint64_t *l2 = (uint64_t *)sweet_gmu_mem + 512;
++	bzero(sweet_gpu_l3x, sizeof(sweet_gpu_l3x));
++	for (unsigned i = 0; i < SWEET_GPU_WIN_TABLES; i++) {
++		l2[((SWEET_GPU_WIN >> 21) & 511) + i] = ml_static_vtop((vm_offset_t)&sweet_gpu_l3x[i * 512]) | 3u;
++	}
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_gmu_mem, 0x3000);
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_gpu_l3x, sizeof(sweet_gpu_l3x));
++	sweet_g2d.smmu = ml_io_map(0x05048000, 0x1000);
++	sweet_g2d.g = g;
++	sweet_g2d.w = w & 0x3ffu;
++	if (sweet_g2d.smmu == 0) {
++		return;
++	}
++	smmu_wr(sweet_g2d.smmu, 0x610, 0);     /* TLBIASID 0 */
++	smmu_wr(sweet_g2d.smmu, 0x7f0, 0);     /* TLBSYNC */
++	for (int i = 0; i < 1000 && (smmu_rd(sweet_g2d.smmu, 0x7f4) & 1u); i++) {
++		delay(10);
++	}
++	/* tu6_init_hw magic registers for a615 + sysmem CCU (tu_emit_cache_flush_ccu) */
++	ring_put(pkt7(0x26, 0));               /* CP_WAIT_FOR_IDLE */
++	ring_reg(0x8e07, 0x10u << 23);         /* RB_CCU_CNTL: colour cache at 64 KiB */
++	ring_reg(0x8e04, 0x04100000u);         /* RB_DBG_ECO_CNTL */
++	ring_reg(0x8e01, 0x00000001u);         /* RB_UNKNOWN_8E01 */
++	ring_reg(0x0e12, 0x00000001u);         /* UCHE_UNKNOWN_0E12 */
++	ring_reg(0xae03, 0x00000430u);         /* SP_CHICKEN_BITS */
++	ring_reg(0xb600, 0x00108000u);         /* TPL1_DBG_ECO_CNTL */
++	ring_reg(0x8600, 0x00000880u);         /* GRAS_DBG_ECO_CNTL */
++	ring_reg(0xbe04, 0x00080000u);         /* HLSQ_DBG_ECO_CNTL */
++	ring_reg(0x9804, 0x0000001fu);         /* PC_MODE_CNTL */
++	ring_reg(0x9805, 0);                   /* PC_POWER_CNTL */
++	sweet_g2d.ready = 1;
++	struct sweet_blit none;
++	bzero(&none, sizeof(none));
++	int rc = sweet_gpu_blit(&none, 0);     /* setup + fence only */
++	GPU_STEP("SWEET G2D: display blit path %s\n", rc == 0 ? "ready" : "FAILED (fence)");
++	if (rc != 0) {
++		sweet_g2d.ready = 0;
++	}
++}
++
++int
++sweet_gpu_ready(void)
++{
++	return sweet_g2d.ready;
++}
++
++int
++sweet_gpu_map(uint32_t va, const uint64_t *pa4k, uint32_t n)
++{
++	if (!sweet_g2d.ready || va < SWEET_GPU_WIN || (va & 0xfffu) ||
++	    ((va - SWEET_GPU_WIN) >> 12) + n > SWEET_GPU_WIN_TABLES * 512) {
++		return -1;
++	}
++	uint64_t *pte = &sweet_gpu_l3x[(va - SWEET_GPU_WIN) >> 12];
++	for (uint32_t i = 0; i < n; i++) {
++		pte[i] = (pa4k[i] & ~0xfffull) | 3u | (1u << 6) | (2u << 8) | (1u << 10);
++	}
++	FlushPoC_DcacheRegion((vm_offset_t)pte, n * sizeof(uint64_t));
++	smmu_wr(sweet_g2d.smmu, 0x610, 0);     /* TLBIASID 0 */
++	smmu_wr(sweet_g2d.smmu, 0x7f0, 0);     /* TLBSYNC */
++	for (int i = 0; i < 1000 && (smmu_rd(sweet_g2d.smmu, 0x7f4) & 1u); i++) {
++		delay(10);
++	}
++	return 0;
++}
++
++int
++sweet_gpu_blit(const struct sweet_blit *b, unsigned n)
++{
++	if (!sweet_g2d.ready) {
++		return -1;
++	}
++	vm_offset_t g = sweet_g2d.g;
++	const uint32_t blit_cntl = (0xfu << 20) | (0x30u << 8);       /* MASK, FMT6_8_8_8_8_UNORM, R2D_UNORM8 */
++	for (unsigned i = 0; i < n; i++) {
++		if (i > 0) {
++			/* the previous blit's output may be this one's input */
++			ring_event_ts(29, SWEET_GPU_IOVA + 0x9020, 0);         /* PC_CCU_FLUSH_COLOR_TS */
++			ring_put(pkt7(0x26, 0));                               /* CP_WAIT_FOR_IDLE */
++		}
++		ring_event(49);                                            /* CACHE_INVALIDATE */
++		ring_reg(0x8c01, 0);                                       /* RB_A2D_PIXEL_CNTL */
++		ring_reg(0x8c00, blit_cntl);                               /* RB_A2D_BLT_CNTL */
++		ring_reg(0x8400, blit_cntl);                               /* GRAS_A2D_BLT_CNTL */
++		ring_reg(0xacc0, (0x30u << 3) | (0xfu << 12));             /* SP_A2D_OUTPUT_INFO */
++		ring_put(pkt4(0x8401, 6));                                 /* GRAS_A2D_SRC_XMIN.. DEST_BR */
++		ring_put((uint32_t)b[i].sx0 << 8);
++		ring_put((uint32_t)b[i].sx1 << 8);
++		ring_put((uint32_t)b[i].sy0 << 8);
++		ring_put((uint32_t)b[i].sy1 << 8);
++		ring_put((uint32_t)b[i].dx0 | ((uint32_t)b[i].dy0 << 16));
++		ring_put((uint32_t)b[i].dx1 | ((uint32_t)b[i].dy1 << 16));
++		ring_put(pkt4(0xb4c0, 5));                                 /* TPL1_A2D_SRC_TEXTURE_* */
++		ring_put(0x30u | (b[i].filter ? (1u << 16) : 0) | (1u << 20) | (1u << 22));
++		ring_put(b[i].src_w | (b[i].src_h << 15));
++		ring_put(b[i].src_va);
++		ring_put(0);
++		ring_put((b[i].src_pitch >> 6) << 9);
++		ring_put(pkt4(0x8c17, 4));                                 /* RB_A2D_DEST_BUFFER_* */
++		ring_put(0x30u);
++		ring_put(b[i].dst_va);
++		ring_put(0);
++		ring_put(b[i].dst_pitch >> 6);
++		ring_put(pkt7(0x2c, 1));                                   /* CP_BLIT */
++		ring_put(3);                                               /* BLIT_OP_SCALE */
++	}
++	uint32_t seq = ++sweet_g2d.seq;
++	ring_event_ts(29, SWEET_GPU_IOVA + 0x9020, seq);               /* PC_CCU_FLUSH_COLOR_TS */
++	ring_event_ts(4, SWEET_GPU_IOVA + 0x9010, seq);                /* CACHE_FLUSH_TS: fence */
++	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA + 0x8000, 0x1000);
++	__asm__ volatile("dsb sy" ::: "memory");
++	GWR(0x807, sweet_g2d.w);               /* CP_RB_WPTR */
++	volatile uint32_t *fence = (volatile uint32_t *)(GPU_DATA + 0x9010);
++	for (int t = 0; t < 5000; t++) {       /* up to 50 ms */
++		FlushPoC_DcacheRegion((vm_offset_t)fence, 64);
++		if (*fence == seq) {
++			return 0;
++		}
++		delay(10);
++	}
++	printf("SWEET G2D: fence %u timeout (have %u) rptr %u wptr %u RBBM_STATUS 0x%08x HW_FAULT 0x%08x INT0 0x%08x\n",
++	    seq, *fence, GR(0x806), sweet_g2d.w, GR(0x210), GR(0x821), GR(0x201));
++	sweet_g2d.ready = 0;                   /* back to the CPU path for good */
++	return -1;
+ }
+ #undef GR
+ #undef GWR
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d8f52c9..5047c88 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -57,6 +57,23 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
+ extern "C" void thread_deallocate(thread_t thread);
++extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
++/* bsd/dev/sweet_usb.c: display blits on the Adreno 2D engine */
++struct sweet_blit {
++	uint32_t src_va, src_pitch, src_w, src_h;
++	int32_t sx0, sy0, sx1, sy1;
++	uint32_t dst_va, dst_pitch;
++	int32_t dx0, dy0, dx1, dy1;
++	int filter;
++};
++extern "C" int sweet_gpu_ready(void);
++extern "C" int sweet_gpu_map(uint32_t va, const uint64_t *pa4k, uint32_t n);
++extern "C" int sweet_gpu_blit(const struct sweet_blit *b, unsigned n);
++#define SWEET_G2D_PANEL_VA      0x70000000u
++#define SWEET_G2D_INTER_VA      0x71000000u
++#define SWEET_G2D_SLOT_VA(i)    (0x72000000u + (uint32_t)(i) * 0x1000000u)
++#define SWEET_G2D_SLOTS         4
++#define SWEET_G2D_WINDOW        0x1000000u
+ class AppleCLCD;
+ struct SweetBilinearWorkerArg {
+ 	AppleCLCD *fb;
+@@ -212,6 +229,16 @@ public:
+ 	static void bilinearWorker(void *arg, wait_result_t wr);
+ 	void bilinearRows(const BilinearJob &j, uint32_t py0, uint32_t py1, uint32_t *tmp);
+ 	uint32_t      *fRowBuf;                 /* one cached row per thread */
++	/* GPU path (sweet_gpu_blit): panel + intermediate mapped once, surface slots */
++	bool          fGpuInit, fGpuBroken;
++	IOBufferMemoryDescriptor *fInter;
++	uint32_t      fInterPitch;
++	uint64_t      *fPages;                  /* scratch list of 4 KiB physical pages */
++	struct { const void *mem; uint32_t id; uint64_t pa0, stamp; } fSlot[SWEET_G2D_SLOTS];
++	uint64_t      fSlotClock;
++	bool gpuSetup();
++	bool gpuMapDescriptor(IOMemoryDescriptor *md, IOByteCount off, IOByteCount len, uint32_t va);
++	bool gpuPresent(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t w, int32_t h);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -581,6 +608,10 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	int layers = 0;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		layers += (mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0;
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -651,6 +682,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScale && layers == 1 && dx == 0 && dy == 0 && w >= (int32_t)fLogicalW &&
++		    h >= (int32_t)fLogicalH && src != 0 && bpe == 4 &&
++		    gpuPresent(s, src, sx, sy, (int32_t)fLogicalW, (int32_t)fLogicalH)) {
++			s->release();
++			continue;
++		}
+ 		if (fScale) {
+ 			presentScaled(s, src, bpe, sx, sy, dx, dy, w, h);
+ 			s->release();
+@@ -758,6 +795,143 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	}
+ }
+ 
++/*
++ * GPU display path. The panel stride (4320 bytes) is not a multiple of the
++ * 64 bytes the 2D engine needs for a destination pitch, so:
++ *  1. scale + bilinear filter the iOS surface into an intermediate buffer
++ *     with a 4352-byte pitch (GPU);
++ *  2. copy its even rows to the panel with pitch 2 x 4320 = 8640 (GPU);
++ *  3. copy its odd rows the same way, the destination base moved back by
++ *     4320 mod 64 = 32 bytes to stay 64-byte aligned and the x range moved
++ *     right by 8 pixels to compensate (GPU).
++ * The CPU only cleans the surface's cache lines (the SMMU walks are not
++ * coherent). Any failure falls back to the CPU path for good.
++ */
++bool
++AppleCLCD::gpuMapDescriptor(IOMemoryDescriptor *md, IOByteCount off, IOByteCount len, uint32_t va)
++{
++	IOByteCount start = off & ~(IOByteCount)0xfff, end = (off + len + 0xfff) & ~(IOByteCount)0xfff;
++	uint32_t n = (uint32_t)((end - start) >> 12);
++	if (n == 0 || n > SWEET_G2D_WINDOW >> 12) {
++		return false;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(start + ((IOByteCount)i << 12), &seg, kIOMemoryMapperNone);
++		if (pa == 0) {
++			return false;
++		}
++		fPages[i] = pa;
++	}
++	return sweet_gpu_map(va, fPages, n) == 0;
++}
++
++bool
++AppleCLCD::gpuSetup()
++{
++	fGpuInit = true;
++	fPages = (uint64_t *)IOMalloc((SWEET_G2D_WINDOW >> 12) * sizeof(uint64_t));
++	fInterPitch = (fWidth * 4 + 63) & ~63u;
++	fInter = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut,
++	    (vm_size_t)fInterPitch * fHeight, page_size);
++	if (fPages == NULL || fInter == NULL || (fHeight & 1) || ((fRowBytes * 2) & 63) || (fRowBytes & 3)) {
++		IOLog("SWEET FB: GPU path unavailable (memory/geometry)\n");
++		return false;
++	}
++	IOMemoryDescriptor *panel = fSurface->memory;
++	if (!gpuMapDescriptor(panel, 0, (IOByteCount)fRowBytes * fHeight, SWEET_G2D_PANEL_VA) ||
++	    !gpuMapDescriptor(fInter, 0, (IOByteCount)fInterPitch * fHeight, SWEET_G2D_INTER_VA)) {
++		IOLog("SWEET FB: GPU path: mapping failed\n");
++		return false;
++	}
++	IOLog("SWEET FB: GPU path on (intermediate pitch %u, panel stride %u)\n", fInterPitch, fRowBytes);
++	return true;
++}
++
++bool
++AppleCLCD::gpuPresent(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t w, int32_t h)
++{
++	if (fGpuBroken || !sweet_gpu_ready()) {
++		return false;
++	}
++	if (!fGpuInit && !gpuSetup()) {
++		fGpuBroken = true;
++		return false;
++	}
++	if (fInter == NULL || s->memory == NULL || (s->bytesPerRow & 63) || (s->offset & 15) ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || sx < 0 || sy < 0 ||
++	    sx + w > (int32_t)s->width || sy + h > (int32_t)s->height) {
++		return false;
++	}
++	IOByteCount len = (IOByteCount)s->bytesPerRow * s->height;
++	if ((s->offset & 0xfff) + len > SWEET_G2D_WINDOW) {
++		return false;
++	}
++	/* surface slot: reuse a mapping when the surface (memory + first page) is the same */
++	IOByteCount seg = 0;
++	uint64_t pa0 = s->memory->getPhysicalSegment(s->offset & ~(IOByteCount)0xfff, &seg, kIOMemoryMapperNone);
++	int slot = -1, lru = 0;
++	for (int i = 0; i < SWEET_G2D_SLOTS; i++) {
++		if (fSlot[i].mem == s->memory && fSlot[i].id == s->id && fSlot[i].pa0 == pa0) {
++			slot = i;
++		}
++		if (fSlot[i].stamp < fSlot[lru].stamp) {
++			lru = i;
++		}
++	}
++	if (slot < 0) {
++		slot = lru;
++		fSlot[slot].mem = NULL;
++		if (!gpuMapDescriptor(s->memory, s->offset, len, SWEET_G2D_SLOT_VA(slot))) {
++			return false;
++		}
++		fSlot[slot].mem = s->memory;
++		fSlot[slot].id = s->id;
++		fSlot[slot].pa0 = pa0;
++	}
++	fSlot[slot].stamp = ++fSlotClock;
++	CleanPoC_DcacheRegion((vm_offset_t)(src + s->offset), len);
++
++	uint32_t half = fHeight / 2, rem = fRowBytes & 63;
++	struct sweet_blit b[3];
++	bzero(b, sizeof(b));
++	b[0].src_va = SWEET_G2D_SLOT_VA(slot) + (uint32_t)(s->offset & 0xfff);
++	b[0].src_pitch = s->bytesPerRow;
++	b[0].src_w = s->width;
++	b[0].src_h = s->height;
++	b[0].sx0 = sx; b[0].sy0 = sy; b[0].sx1 = sx + w - 1; b[0].sy1 = sy + h - 1;
++	b[0].dst_va = SWEET_G2D_INTER_VA;
++	b[0].dst_pitch = fInterPitch;
++	b[0].dx0 = 0; b[0].dy0 = 0; b[0].dx1 = (int32_t)fWidth - 1; b[0].dy1 = (int32_t)fHeight - 1;
++	b[0].filter = fFilter ? 1 : 0;
++	for (int k = 0; k < 2; k++) {
++		struct sweet_blit *c = &b[1 + k];
++		c->src_va = SWEET_G2D_INTER_VA + (uint32_t)k * fInterPitch;
++		c->src_pitch = fInterPitch * 2;
++		c->src_w = fWidth;
++		c->src_h = half;
++		c->sx0 = 0; c->sy0 = 0; c->sx1 = (int32_t)fWidth - 1; c->sy1 = (int32_t)half - 1;
++		c->dst_va = SWEET_G2D_PANEL_VA + (k ? fRowBytes - rem : 0);
++		c->dst_pitch = fRowBytes * 2;
++		c->dx0 = k ? (int32_t)(rem / 4) : 0;
++		c->dx1 = c->dx0 + (int32_t)fWidth - 1;
++		c->dy0 = 0; c->dy1 = (int32_t)half - 1;
++		c->filter = 0;
++	}
++	if (sweet_gpu_blit(b, 3) != 0) {
++		IOLog("SWEET FB: GPU blit failed, back to the CPU path\n");
++		fGpuBroken = true;
++		return false;
++	}
++	static int logged;
++	if (!logged) {
++		logged = 1;
++		IOLog("SWEET FB: first GPU present: surface %u %ux%u bpr %u slot %d\n", s->id, s->width,
++		    s->height, s->bytesPerRow, slot);
++	}
++	return true;
++}
++
+ static inline uint32_t
+ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
+ {
