@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2929ea0..a662a62 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -40,6 +40,9 @@ struct rtentry;
+ extern int rtrequest(int, struct sockaddr *, struct sockaddr *, struct sockaddr *, int, struct rtentry **);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/arm/machine_routines.h declares these only for PEXPERT/MACH_KERNEL_PRIVATE */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ #ifndef VM_WIMG_IO
+ #define VM_WIMG_IO 0x7                  /* osfmk/arm/memory_types.h */
+ #endif
