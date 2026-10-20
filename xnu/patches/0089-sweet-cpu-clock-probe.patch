@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index f1e50ca..b27a0ab 100644
+index f1e50ca..7f3b468 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -40,6 +40,7 @@ extern int rtrequest(int, struct sockaddr *, struct sockaddr *, struct sockaddr
+@@ -16,6 +16,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/cpu_number.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -40,6 +41,7 @@ extern int rtrequest(int, struct sockaddr *, struct sockaddr *, struct sockaddr
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  void sweet_usb_probe(void);
  static void sweet_usb_gadget_start(vm_offset_t dwc);
@@ -10,7 +18,7 @@ index f1e50ca..b27a0ab 100644
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  
  #define GCC_PA                  0x00100000
-@@ -92,6 +93,7 @@ sweet_usb_probe(void)
+@@ -92,6 +94,7 @@ sweet_usb_probe(void)
  	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
  	bool clocks_on = true;
  
@@ -18,7 +26,7 @@ index f1e50ca..b27a0ab 100644
  	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
  	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
  	if (!enabled) {
-@@ -302,6 +304,65 @@ ud_sleep_ms(unsigned ms)
+@@ -302,6 +305,65 @@ ud_sleep_ms(unsigned ms)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
