@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f1e50ca..b27a0ab 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -40,6 +40,7 @@ extern int rtrequest(int, struct sockaddr *, struct sockaddr *, struct sockaddr
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void sweet_cpufreq_start(void);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -92,6 +93,7 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++	sweet_cpufreq_start();
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+@@ -302,6 +304,65 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * CPU clock check (not USB, lives here for its kernel thread helpers):
++ * 90 s after boot, run on each CPU in turn and count PMU cycles against
++ * the generic timer for ~5 ms with interrupts off. Nothing programs the
++ * Qualcomm OSM/cpufreq here, so the cores keep whatever clock ABL left.
++ * Boot-arg sweetcpufreq=0 skips it.
++ */
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
++
++static void
++sweet_cpufreq_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	ud_sleep_ms(90000);
++	int maxcpu = ml_get_max_cpu_number();
++	for (int i = 0; i <= maxcpu; i++) {
++		processor_t p = cpu_to_processor(i);
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		(void)thread_bind(p);
++		thread_block(THREAD_CONTINUE_NULL);
++		boolean_t ints = ml_set_interrupts_enabled(FALSE);
++		uint64_t midr, pmcr, c0, c1, t0, t1, now;
++		__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
++		__asm__ volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
++		__asm__ volatile("msr pmcr_el0, %0" :: "r"((pmcr | 1u) & ~(1ull << 3)));  /* E=1, D=0 */
++		__asm__ volatile("msr pmcntenset_el0, %0" :: "r"(1ull << 31));
++		__asm__ volatile("msr pmccfiltr_el0, %0" :: "r"(1ull << 27));            /* count at EL2 too */
++		__asm__ volatile("isb");
++		t0 = mach_absolute_time();
++		__asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c0));
++		do {
++			now = mach_absolute_time();
++		} while (now - t0 < 96000);     /* 5 ms at 19.2 MHz */
++		__asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c1));
++		t1 = mach_absolute_time();
++		ml_set_interrupts_enabled(ints);
++		uint64_t ns;
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		printf("SWEET CPU: cpu %d (on %d) part %#llx: %llu MHz\n", i, cpu_number(),
++		    (midr >> 4) & 0xfffu, ns ? (c1 - c0) * 1000ull / ns : 0ull);
++	}
++	(void)thread_bind(PROCESSOR_NULL);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sweet_cpufreq_start(void)
++{
++	int on = 1;
++	thread_t thread;
++	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
++	if (on && kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
