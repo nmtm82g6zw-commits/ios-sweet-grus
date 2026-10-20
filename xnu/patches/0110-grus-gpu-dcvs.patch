@@ -1,0 +1,105 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 30a8ea5..53b3f7b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -54,7 +54,7 @@ static void sweet_gpu_smmu_dump(void);
+ static int sweet_gpu_smmu_map(void);
+ static int sweet_gpu_zap(void);
+ static void sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu);
+-static void sweet_gpu_blit_setup(vm_offset_t g, uint32_t w);
++static void sweet_gpu_blit_setup(vm_offset_t g, uint32_t w, vm_offset_t gmu);
+ static void sweet_hfi_start(vm_offset_t gmu);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -1242,7 +1242,7 @@ sweet_gpu_cp_test(vm_offset_t g, vm_offset_t gmu)
+ 	GPU_STEP("SWEET CP: target word 0x%08x -> %s\n", dst[0],
+ 	    dst[0] == 0x00c0ffeeu ? "THE GPU EXECUTED OUR COMMAND" : "not written");
+ 	if (dst[0] == 0x00c0ffeeu) {
+-		sweet_gpu_blit_setup(g, w);
++		sweet_gpu_blit_setup(g, w, gmu);
+ 	}
+ }
+ 
+@@ -1317,9 +1317,36 @@ ring_event_ts(uint32_t ev, uint32_t va, uint32_t val)
+ 	ring_put(val);
+ }
+ 
++/*
++ * GPU clock (0110: the 2D path took 66 ms a frame, the GPU still at its
++ * boot clock). Legacy GMU DCVS as Linux a6xx_gmu_set_freq: DCVS_ACK_OPTION
++ * 0, DCVS_PERF_SETTING (3 << 28) | perf index into the HFI perf table
++ * (0 off, 1 180, 2 267, 3 355, 4 430 MHz), DCVS_BW_SETTING 0xff (firmware
++ * picks the bus vote), OOB DCVS_SET (set 23 / ack 31), then DCVS_RETURN.
++ * Boot-arg sweetgpufreq=N picks the index (default 4).
++ */
++static void
++sweet_gpu_set_freq(vm_offset_t gmu)
++{
++	int idx = 4;
++	PE_parse_boot_argn("sweetgpufreq", &idx, sizeof(idx));
++	idx = idx < 1 ? 1 : (idx > 4 ? 4 : idx);
++	vm_offset_t cc = ml_io_map(0x05090000, 0x9000);
++	uint32_t before = cc ? usb_rd(cc, 0x1020) : 0;        /* gx_gfx3d RCG CFG */
++	*(volatile uint32_t *)(gmu + (0x23fcu << 2)) = 0;                      /* DCVS_ACK_OPTION */
++	*(volatile uint32_t *)(gmu + (0x23fdu << 2)) = (3u << 28) | (uint32_t)idx;   /* DCVS_PERF_SETTING */
++	*(volatile uint32_t *)(gmu + (0x23feu << 2)) = 0xffu;                  /* DCVS_BW_SETTING */
++	int ok = sweet_gmu_oob(gmu, 23, 31, "DCVS_SET") == 0;
++	*(volatile uint32_t *)(gmu + (0x5194u << 2)) = 1u << 31;              /* clear DCVS_SET */
++	GPU_STEP("SWEET GPU: DCVS to perf index %d (%u MHz) %s: DCVS_RETURN %d, gfx3d RCG cfg 0x%08x -> 0x%08x cmd 0x%08x\n",
++	    idx, sweet_gpu_khz[idx] / 1000, ok ? "acked" : "NOT acked",
++	    (int)usb_rd(gmu, 0x23ffu << 2), before, cc ? usb_rd(cc, 0x1020) : 0, cc ? usb_rd(cc, 0x101c) : 0);
++}
++
+ static void
+-sweet_gpu_blit_setup(vm_offset_t g, uint32_t w)
++sweet_gpu_blit_setup(vm_offset_t g, uint32_t w, vm_offset_t gmu)
+ {
++	sweet_gpu_set_freq(gmu);
+ 	int on = 1;
+ 	PE_parse_boot_argn("sweetfb_gpu", &on, sizeof(on));
+ 	if (!on) {
+@@ -1436,11 +1463,20 @@ sweet_gpu_blit(const struct sweet_blit *b, unsigned n)
+ 	ring_event_ts(4, SWEET_GPU_IOVA + 0x9010, seq);                /* CACHE_FLUSH_TS: fence */
+ 	FlushPoC_DcacheRegion((vm_offset_t)GPU_DATA + 0x8000, 0x1000);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t t0 = mach_absolute_time();
+ 	GWR(0x807, sweet_g2d.w);               /* CP_RB_WPTR */
+ 	volatile uint32_t *fence = (volatile uint32_t *)(GPU_DATA + 0x9010);
+-	for (int t = 0; t < 5000; t++) {       /* up to 50 ms */
++	for (int t = 0; t < 20000; t++) {      /* up to 200 ms */
+ 		FlushPoC_DcacheRegion((vm_offset_t)fence, 64);
+ 		if (*fence == seq) {
++			static uint64_t sum, n;
++			sum += mach_absolute_time() - t0;
++			if (++n == 100) {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(sum / n, &ns);
++				printf("SWEET G2D: GPU time avg %llu us over %llu submissions\n", ns / 1000, n);
++				sum = n = 0;
++			}
+ 			return 0;
+ 		}
+ 		delay(10);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5047c88..21cf500 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -890,7 +890,18 @@ AppleCLCD::gpuPresent(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, in
+ 		fSlot[slot].pa0 = pa0;
+ 	}
+ 	fSlot[slot].stamp = ++fSlotClock;
++	uint64_t c0 = mach_absolute_time();
+ 	CleanPoC_DcacheRegion((vm_offset_t)(src + s->offset), len);
++	{
++		static uint64_t sum, n;
++		sum += mach_absolute_time() - c0;
++		if (++n == 100) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(sum / n, &ns);
++			IOLog("SWEET FB: surface cache clean avg %llu us (%llu bytes)\n", ns / 1000, (unsigned long long)len);
++			sum = n = 0;
++		}
++	}
+ 
+ 	uint32_t half = fHeight / 2, rem = fRowBytes & 63;
+ 	struct sweet_blit b[3];
