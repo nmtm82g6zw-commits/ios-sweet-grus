@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fd934a4..2204bd6 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -763,9 +763,251 @@ sweet_hfi_send(vm_offset_t gmu, unsigned id, uint32_t *msg, unsigned dwords, uin
+ 	return -1;
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 5 (sweetgpu=4): GX power, as Linux
++ * a6xx_gmu_rpmh_votes_init / a6xx_gmu_fw_start / a6xx_hfi_start_v1 /
++ * a6xx_gmu_set_oob(GPU_SET) for the legacy (a630-family) GMU.
++ * Votes come from cmd-db (reserved RAM 0x85fe0000, sdm670 aop-cmd-db-mem):
++ * ARC aux data "gfx.lvl" / "mx.lvl" / "cx.lvl" = u16 voltage levels per
++ * hardware level. GPU levels (grus gpucc-sdm845.c sdm670 fixup, rpmh
++ * levels without the downstream +1 offset): 180 MHz MIN_SVS 48, 267 MHz
++ * LOW_SVS 64, 355 MHz SVS 128, 430 MHz SVS_L1 192, plus the "off" level 0;
++ * GMU: 0 and 200 MHz LOW_SVS 64. Bandwidth table: one "off" level like
++ * a618_build_bw_table, BCM addresses looked up by name (SH0, MC0, ACV,
++ * CN0) instead of sdm845's hardcoded ones.
++ */
++static vm_offset_t sweet_cmddb;
++
++static uint32_t
++cmddb_rd(uint32_t off)
++{
++	return usb_rd(sweet_cmddb, off & ~3u) >> (8u * (off & 3u));
++}
++
++/* Returns the resource address, or 0; aux data offset/length on request. */
++static uint32_t
++cmddb_find(const char *name, uint32_t *aux, uint32_t *len)
++{
++	uint32_t key[2] = { 0, 0 };
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		if (!(cmddb_rd(h) & 0xffffu)) {
++			break;
++		}
++		uint32_t ent = 144u + (cmddb_rd(h + 2) & 0xffffu);
++		uint32_t dat = 144u + (cmddb_rd(h + 4) & 0xffffu);
++		unsigned cnt = cmddb_rd(h + 6) & 0xffffu;
++		for (unsigned j = 0; j < cnt && ent + 24u * (j + 1) <= 0x20000u; j++) {
++			uint32_t e = ent + 24u * j;
++			if (usb_rd(sweet_cmddb, e) == key[0] && usb_rd(sweet_cmddb, e + 4) == key[1]) {
++				if (aux) {
++					*aux = dat + (cmddb_rd(e + 22) & 0xffffu);
++				}
++				if (len) {
++					*len = cmddb_rd(e + 20) & 0xffffu;
++				}
++				return usb_rd(sweet_cmddb, e + 16);
++			}
++		}
++	}
++	return 0;
++}
++
++/* a6xx_gmu_rpmh_arc_votes_init */
++static int
++sweet_arc_votes(const char *pri_name, const unsigned *levels, unsigned n, uint32_t *votes)
++{
++	uint32_t pa, pl, sa, sl;
++	if (!cmddb_find(pri_name, &pa, &pl) || !cmddb_find("mx.lvl", &sa, &sl)) {
++		printf("SWEET GPU: cmd-db has no %s/mx.lvl\n", pri_name);
++		return -1;
++	}
++	unsigned pc = pl / 2, sc = sl / 2;
++	char line[160];
++	int o = snprintf(line, sizeof(line), "SWEET GPU: cmd-db %s:", pri_name);
++	for (unsigned j = 0; j < pc && j < 16 && o < 140; j++) {
++		o += snprintf(line + o, sizeof(line) - (size_t)o, " %u", cmddb_rd(pa + 2 * j) & 0xffffu);
++	}
++	o += snprintf(line + o, sizeof(line) - (size_t)o, " / mx.lvl:");
++	for (unsigned j = 0; j < sc && j < 16 && o < 150; j++) {
++		o += snprintf(line + o, sizeof(line) - (size_t)o, " %u", cmddb_rd(sa + 2 * j) & 0xffffu);
++	}
++	printf("%s\n", line);
++	for (unsigned i = 0; i < n; i++) {
++		unsigned pidx = 0, sidx = 0, j;
++		for (j = 0; j < pc; j++) {
++			if ((cmddb_rd(pa + 2 * j) & 0xffffu) >= levels[i]) {
++				pidx = j;
++				break;
++			}
++		}
++		if (j == pc) {
++			printf("SWEET GPU: level %u not in %s\n", levels[i], pri_name);
++			return -1;
++		}
++		for (j = 0; j < sc; j++) {
++			unsigned v = cmddb_rd(sa + 2 * j) & 0xffffu;
++			if (v >= levels[i]) {
++				sidx = j;
++				break;
++			} else if (v) {
++				sidx = j;
++			}
++		}
++		votes[i] = ((cmddb_rd(pa + 2 * pidx) & 0xffffu) << 16) | (sidx << 8) | pidx;
++	}
++	return 0;
++}
++
++static const unsigned sweet_gpu_khz[5] = { 0, 180000, 267000, 355000, 430000 };
++static const unsigned sweet_gpu_lvl[5] = { 0, 48, 64, 128, 192 };
++static const unsigned sweet_gmu_khz[2] = { 0, 200000 };
++static const unsigned sweet_gmu_lvl[2] = { 0, 64 };
++static uint32_t sweet_gx_votes[5], sweet_cx_votes[2];
++
++static int
++sweet_gpu_votes(void)
++{
++	if (!sweet_cmddb) {
++		sweet_cmddb = ml_io_map(0x85fe0000, 0x20000);
++	}
++	if (!sweet_cmddb || usb_rd(sweet_cmddb, 4) != 0x0c0330dbu) {
++		printf("SWEET GPU: no cmd-db at 0x85fe0000 (magic 0x%x)\n", sweet_cmddb ? usb_rd(sweet_cmddb, 4) : 0);
++		return -1;
++	}
++	if (sweet_arc_votes("gfx.lvl", sweet_gpu_lvl, 5, sweet_gx_votes) ||
++	    sweet_arc_votes("cx.lvl", sweet_gmu_lvl, 2, sweet_cx_votes)) {
++		return -1;
++	}
++	GPU_STEP("SWEET GPU: gx votes 0x%x 0x%x 0x%x 0x%x 0x%x, cx votes 0x%x 0x%x; BCM SH0 0x%x MC0 0x%x ACV 0x%x CN0 0x%x\n",
++	    sweet_gx_votes[0], sweet_gx_votes[1], sweet_gx_votes[2], sweet_gx_votes[3], sweet_gx_votes[4],
++	    sweet_cx_votes[0], sweet_cx_votes[1], cmddb_find("SH0", NULL, NULL), cmddb_find("MC0", NULL, NULL),
++	    cmddb_find("ACV", NULL, NULL), cmddb_find("CN0", NULL, NULL));
++	return 0;
++}
++
++/* a6xx_gmu_set_oob, legacy bits: poll the ack, clear it. */
++static int
++sweet_gmu_oob(vm_offset_t gmu, unsigned set, unsigned ack, const char *name)
++{
++	*(volatile uint32_t *)(gmu + (0x5194u << 2)) = 1u << set;     /* HOST2GMU_INTR_SET */
++	uint32_t v = 0;
++	int n;
++	for (n = 0; n < 1000; n++) {           /* up to 100 ms */
++		v = usb_rd(gmu, 0x5192u << 2);
++		if (v & (1u << ack)) {
++			break;
++		}
++		delay(100);
++	}
++	*(volatile uint32_t *)(gmu + (0x5191u << 2)) = 1u << ack;     /* GMU2HOST_INTR_CLR */
++	GPU_STEP("SWEET GPU: OOB %s %s after %d00 us (intr 0x%x)\n", name,
++	    (v & (1u << ack)) ? "acked" : "TIMEOUT", n, v);
++	return (v & (1u << ack)) ? 0 : -1;
++}
++
++/* Before HFI_CTRL_INIT: a6xx_gmu_gfx_rail_on + a6xx_sptprac_enable. */
++static int
++sweet_gpu_rail_on(vm_offset_t gmu)
++{
++	if (sweet_gpu_votes()) {
++		return -1;
++	}
++	uint32_t vote = sweet_gx_votes[4];     /* highest level, like Linux */
++	*(volatile uint32_t *)(gmu + (0x23f8u << 2)) = 0;              /* BOOT_SLUMBER_OPTION */
++	*(volatile uint32_t *)(gmu + (0x23f9u << 2)) = vote & 0xffu;   /* GX_VOTE_IDX */
++	*(volatile uint32_t *)(gmu + (0x23fau << 2)) = (vote >> 8) & 0xffu;  /* MX_VOTE_IDX */
++	if (sweet_gmu_oob(gmu, 22, 30, "BOOT_SLUMBER")) {
++		return -1;
++	}
++	*(volatile uint32_t *)(gmu + (0x81u << 2)) = 0x778000;         /* GX_SPTPRAC_POWER_CONTROL */
++	uint32_t v = 0;
++	for (int n = 0; n < 100; n++) {
++		v = usb_rd(gmu, 0x50d0u << 2);
++		if ((v & 0x38u) == 0x28u) {
++			break;
++		}
++		delay(1);
++	}
++	GPU_STEP("SWEET GPU: SPTPRAC %s (0x%x)\n", (v & 0x38u) == 0x28u ? "on" : "NOT on", v);
++	return 0;
++}
++
++static uint32_t sweet_hfi_big[170];
++
++/* After FW_VERSION: perf table, bandwidth table, test; then GPU_SET. */
++static void
++sweet_gpu_power_up(vm_offset_t gmu)
++{
++	uint32_t resp[20], *m = sweet_hfi_big;
++	bzero(m, sizeof(sweet_hfi_big));
++	m[1] = 5;                              /* num_gpu_levels */
++	m[2] = 2;                              /* num_gmu_levels */
++	for (unsigned i = 0; i < 5; i++) {
++		m[3 + 2 * i] = sweet_gx_votes[i];
++		m[4 + 2 * i] = sweet_gpu_khz[i];
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		m[3 + 32 + 2 * i] = sweet_cx_votes[i];
++		m[4 + 32 + 2 * i] = sweet_gmu_khz[i];
++	}
++	if (sweet_hfi_send(gmu, 4, m, 3 + 32 + 8, resp)) {             /* PERF_TABLE v1 */
++		return;
++	}
++	uint32_t sh0 = cmddb_find("SH0", NULL, NULL), mc0 = cmddb_find("MC0", NULL, NULL);
++	uint32_t acv = cmddb_find("ACV", NULL, NULL), cn0 = cmddb_find("CN0", NULL, NULL);
++	if (!sh0 || !mc0 || !acv || !cn0) {
++		printf("SWEET GPU: BCM addresses missing in cmd-db\n");
++		return;
++	}
++	bzero(m, sizeof(sweet_hfi_big));
++	/* header, bw_level_num, cnoc_cmds_num, ddr_cmds_num, cnoc_wait, ddr_wait,
++	 * cnoc_addrs[6] @6, cnoc_data[2][6] @12, ddr_addrs[8] @24, ddr_data[16][8] @32 */
++	m[1] = 1; m[2] = 1; m[3] = 3; m[4] = 1; m[5] = 1;
++	m[6] = cn0;
++	m[12] = 0x40000000u; m[18] = 0x60000001u;
++	m[24] = sh0; m[25] = mc0; m[26] = acv;
++	m[32] = 0x40000000u; m[33] = 0x40000000u; m[34] = 0x40000000u;
++	if (sweet_hfi_send(gmu, 3, m, 32 + 128, resp)) {               /* BW_TABLE */
++		return;
++	}
++	bzero(m, 8);
++	(void)sweet_hfi_send(gmu, 5, m, 1, resp);                      /* TEST */
++
++	/* a6xx_gmu_set_oob(GPU_SET): the GMU powers the GX domain */
++	int ok = sweet_gmu_oob(gmu, 16, 24, "GPU_SET") == 0;
++	vm_offset_t cc = ml_io_map(0x05090000, 0x9000);
++	uint32_t gx = cc ? usb_rd(cc, 0x100c) : 0;
++	GPU_STEP("SWEET GPU: after GPU_SET: GX GDSC 0x%08x gx_gfx3d 0x%08x rpmh_power 0x%x cx_busy 0x%x\n",
++	    gx, cc ? usb_rd(cc, 0x1054) : 0, usb_rd(gmu, 0x50ecu << 2), usb_rd(gmu, 0x930cu << 2));
++	if (!ok || !(gx & (1u << 31))) {
++		printf("SWEET GPU: GX not powered: GPU registers not touched\n");
++		return;
++	}
++	vm_offset_t g = ml_io_map(0x05000000, 0x40000);
++	if (!g) {
++		return;
++	}
++	GPU_STEP("SWEET GPU: GX on, reading GPU core registers\n");
++	uint32_t st = usb_rd(g, 0x210u << 2), irq = usb_rd(g, 0x201u << 2);
++	*(volatile uint32_t *)(g + (0x883u << 2)) = 0x5eedc0deu;       /* CP_SCRATCH[0] */
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t back = usb_rd(g, 0x883u << 2);
++	GPU_STEP("SWEET GPU: RBBM_STATUS 0x%08x RBBM_INT_0_STATUS 0x%08x CP_SCRATCH0 write test %s (0x%08x)\n",
++	    st, irq, back == 0x5eedc0deu ? "OK" : "FAILED", back);
++}
++
+ static void
+ sweet_hfi_start(vm_offset_t gmu)
+ {
++	int level = 0, gx = 0;
++	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	if (level >= 4) {
++		gx = sweet_gpu_rail_on(gmu) == 0;
++	}
+ 	uint32_t m[8], resp[20];
+ 	GPU_STEP("SWEET HFI: HFI_CTRL_INIT\n");
+ 	*(volatile uint32_t *)(gmu + (0x5186u << 2)) = 1;     /* HFI_CTRL_INIT */
+@@ -792,6 +1034,11 @@ sweet_hfi_start(vm_offset_t gmu)
+ 	m[1] = (1u << 28) | (1u << 19) | (1u << 17);       /* supported version 1.10 */
+ 	if (sweet_hfi_send(gmu, 1, m, 2, resp) == 0) {     /* H2F_MSG_FW_VERSION */
+ 		printf("SWEET HFI: GMU firmware version 0x%08x\n", resp[3]);
++	} else {
++		return;
++	}
++	if (gx) {
++		sweet_gpu_power_up(gmu);
+ 	}
+ }
+ 
