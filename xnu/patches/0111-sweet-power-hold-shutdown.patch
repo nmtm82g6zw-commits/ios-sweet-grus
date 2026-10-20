@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 747f56b..acde50a 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -16,6 +16,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern int reboot_kernel(int howto, char *message);
++#define SWEET_RB_HALT 0x08                     /* RB_HALT, sys/reboot.h */
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -113,6 +115,21 @@ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++	/*
++	 * Power off by holding the side button. The iPhone X chord (side +
++	 * volume) reaches iOS correctly (log 2026-10-20: 0x30 + 0xe9/0xea down
++	 * together) but no power-off slider appears, presumably because that
++	 * screen is the Emergency SOS UI, which needs the telephony stack this
++	 * image does not run. Holding power for sweetpoweroff_ms (default
++	 * 4000, 0 = off) without volume down halts the system the way the
++	 * halt command does: processes stopped, disks synced, filesystems
++	 * unmounted, then PSCI SYSTEM_OFF. Power + volume down stays the PMIC
++	 * reset / fastboot chord and never triggers it.
++	 */
++	uint32_t hold_ms = 4000;
++	(void)PE_parse_boot_argn("sweetpoweroff_ms", &hold_ms, sizeof(hold_ms));
++	uint64_t power_since = 0;
++	bool halting = false;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -136,6 +153,22 @@ keys_thread(void *arg, wait_result_t result)
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		if (hold_ms != 0 && !halting) {
++			uint64_t now_abs = mach_absolute_time();
++			if (!state[0] || state[2]) {
++				power_since = 0;
++			} else if (power_since == 0) {
++				power_since = now_abs;
++			} else {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(now_abs - power_since, &ns);
++				if (ns >= (uint64_t)hold_ms * NSEC_PER_MSEC) {
++					halting = true;
++					printf("SWEET KEYS: power held %u ms: shutting down\n", hold_ms);
++					(void)reboot_kernel(SWEET_RB_HALT, (char *)"power button held");
++				}
++			}
++		}
+ 		keys_wait();
+ 	}
+ }
