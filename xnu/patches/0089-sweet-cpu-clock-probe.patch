@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index f1e50ca..7f3b468 100644
+index f1e50ca..e5857be 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -16,6 +16,7 @@
@@ -26,7 +26,7 @@ index f1e50ca..7f3b468 100644
  	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
  	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
  	if (!enabled) {
-@@ -302,6 +305,65 @@ ud_sleep_ms(unsigned ms)
+@@ -302,6 +305,66 @@ ud_sleep_ms(unsigned ms)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -39,6 +39,7 @@ index f1e50ca..7f3b468 100644
 + */
 +extern processor_t cpu_to_processor(int cpu);
 +extern processor_t thread_bind(processor_t processor);
++extern kern_return_t thread_terminate(thread_t);
 +
 +static void
 +sweet_cpufreq_thread(void *arg __unused, wait_result_t wr __unused)
