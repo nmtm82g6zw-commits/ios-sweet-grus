@@ -194,3 +194,11 @@ turned into resets: the panic text stays on the screen.
   ready) the Mac enumerates `ios-sweet "Sweet iOS (USB Ethernet)"` as a
   CDC-ECM interface, ping 192.168.7.2 answers in ~2 ms with 0 % loss, and the
   live kernel log arrives on UDP 5140 (`run/18-usbnet-mac.sh` on macOS).
+- CPU clocks (0089 probe, 0090 cpufreq-hw): ABL leaves the A55 cluster at
+  1516 MHz and the two A75 at 299 MHz (the 300 MHz GPLL0 row). Selecting the
+  top non-turbo LUT row at boot gives 1708 MHz / 2303 MHz, measured with the
+  PMU cycle counter; the GUI is visibly smoother.
+- Touch: polling GT9886 without waiting for its IRQ reads frames while the
+  controller rewrites them (torn reads, checksum errors); `sweettouchirq=1`
+  cuts the errors by ~18x. The framebuffer copy costs ~5 % of one CPU at
+  ~10 frames/s, so it is not the bottleneck.
