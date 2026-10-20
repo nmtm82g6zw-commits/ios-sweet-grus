@@ -202,3 +202,34 @@ turned into resets: the panic text stays on the screen.
   controller rewrites them (torn reads, checksum errors); `sweettouchirq=1`
   cuts the errors by ~18x. The framebuffer copy costs ~5 % of one CPU at
   ~10 frames/s, so it is not the bottleneck.
+
+## Adreno 616 bring-up (patches 0091-0103, 2026-10-20)
+
+Boot-arg `sweetgpu=N` (each level includes the previous ones); levels 2+
+run from a thread 45 s after boot so the live USB log (`sweetusb=2`,
+`run/18-usbnet-mac.sh`) catches a firmware reset. Firmware (Qualcomm,
+from the phone's /vendor/firmware, never committed) goes into a locally
+built ADT: `tools/adt-add-gpu-fw.py IN.adt OUT.adt a630_gmu.bin
+--zap a615_zap --sqe a630_sqe.fw`.
+
+| Level | What | Result on the phone |
+|---|---|---|
+| probe | GCC/GPU_CC state as ABL leaves it | GPU fully off (CX/GX GDSCs collapsed) |
+| 1 | CX GDSC, AXI/memnoc, cx_gmu clock, GMU ITCM test | OK |
+| 2 | GMU clock 200 MHz, RSCC/PDC init, legacy a630 GMU firmware | `0xbabeface` in 0.1 ms |
+| 3 | GPU SMMU context bank 0 (iova 0x60000000), HFI queues, MSG_INIT, FW_VERSION | GMU fw 0x10070000 |
+| 4 | cmd-db ARC votes, BOOT_SLUMBER + SPTPRAC, perf/bw/test HFI, OOB GPU_SET | GX GDSC on, RBBM/CP_SCRATCH OK |
+| 5 | zap shader: SCM PAS 13 into gpu_region 0x96015000 | AUTH_AND_RESET ret 0 |
+| 6 | hw_init subset, SQE, 4 KiB ring, CP_ME_INIT, SET_SECURE_MODE 0, CP_MEM_WRITE | **0x00c0ffee written by the GPU** |
+
+Findings worth keeping:
+- The GPU SMMU (0x05040000) global space is trapped and emulated by
+  Qualcomm's hypervisor: accesses must be plain single-register ldr/str
+  (a post-indexed load hangs the CPU, ISV=0), and an SMR with a mask was
+  silently dropped; one SMR per stream ID works (GMU 4/5, GPU 0/1).
+- An unmatched GMU stream makes the firmware reset the whole phone.
+- cmd-db is at 0x85fe0000; BCM addresses SH0 0x5003c, MC0 0x50000,
+  ACV 0x5000c (same as Linux's a618 table), CN0 0x500a8.
+- The zap region on grus is 0x96015000 (stock DTB), not 0x95c15000.
+- SCM standard calls come back with QCOM_SCM_INTERRUPTED (1) during
+  PAS_INIT_IMAGE: resume with x0 = 1 and the returned x6 (A6 quirk).
