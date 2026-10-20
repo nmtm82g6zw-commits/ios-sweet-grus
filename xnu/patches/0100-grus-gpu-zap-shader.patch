@@ -1,0 +1,167 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2204bd6..9d7770e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -51,6 +51,7 @@ static void ud_sleep_ms(unsigned ms);
+ static void sweet_gpu_gmu_boot(vm_offset_t gcc, vm_offset_t cc, vm_offset_t gmu);
+ static void sweet_gpu_smmu_dump(void);
+ static int sweet_gpu_smmu_map(void);
++static void sweet_gpu_zap(void);
+ static void sweet_hfi_start(vm_offset_t gmu);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -909,6 +910,142 @@ sweet_gmu_oob(vm_offset_t gmu, unsigned set, unsigned ack, const char *name)
+ 	return (v & (1u << ack)) ? 0 : -1;
+ }
+ 
++/*
++ * Adreno 616 bring-up, step 6 (sweetgpu=5): zap shader through TrustZone,
++ * like Linux zap_shader_load_mdt + qcom_mdt_load + qcom_scm PAS calls, with
++ * the GPU powered. grus stock DTB: qcom,kgsl-hyp pas-id 13 "a615_zap",
++ * memory-region gpu_region@0x96015000 size 0x2000 (removed-dma-pool).
++ * a615_zap.mdt: ELF32, phdr 1 = hash, phdr 2 = PT_LOAD paddr 0x5000 size
++ * 0x7c0, relocatable (flags bit 27). The .mdt file (headers + hash, 6684
++ * bytes) is the PAS metadata; each loadable segment N is ADT property
++ * zap-b0N (tools/adt-add-gpu-fw.py --zap). SCM: SMCCC 64-bit SIP standard
++ * calls, svc PIL 2: IS_SUPPORTED 7, INIT_IMAGE 1 (pas, metadata pa;
++ * arginfo VAL,RW), MEM_SETUP 2 (pas, addr, size), AUTH_AND_RESET 5.
++ */
++#define ZAP_PAS 13u
++#define ZAP_MEM_PA 0x96015000u
++#define ZAP_MEM_SIZE 0x2000u
++static uint8_t sweet_zap_meta[0x2000] __attribute__((aligned(0x1000)));
++
++static uint64_t
++sweet_scm(uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *r1)
++{
++	uint64_t ret = 0, res1 = 0;
++	for (int tries = 0; tries < 50; tries++) {
++		register uint64_t x0 __asm__("x0") = 0x42000200ull | cmd;    /* STD, SMC64, SIP, svc 2 */
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = 0;
++		__asm__ volatile("dsb sy\n\tsmc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++		    "+r"(x4), "+r"(x5), "+r"(x6) : : "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "memory");
++		ret = x0;
++		res1 = x1;
++		if ((int64_t)ret != -12) {             /* QCOM_SCM_V2_EBUSY: retry */
++			break;
++		}
++		delay(1000);
++	}
++	if (r1) {
++		*r1 = res1;
++	}
++	return ret;
++}
++
++static void
++sweet_gpu_zap(void)
++{
++	DTEntry node;
++	void const *mdt = NULL;
++	unsigned int mdt_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-mdt", &mdt, &mdt_size) != kSuccess ||
++	    mdt_size < 52 || mdt_size > sizeof(sweet_zap_meta)) {
++		printf("SWEET ZAP: no zap-mdt in the ADT (size %u)\n", mdt_size);
++		return;
++	}
++	const uint8_t *e = mdt;
++	uint32_t phoff = *(const uint32_t *)(e + 28);
++	unsigned phent = *(const uint16_t *)(e + 42), phnum = *(const uint16_t *)(e + 44);
++	if (e[4] != 1 || phent != 32 || phnum > 8 || phoff + phent * phnum > mdt_size) {
++		printf("SWEET ZAP: unexpected mdt header\n");
++		return;
++	}
++	uint64_t r1 = 0, rc = sweet_scm(7, 1, ZAP_PAS, 0, 0, &r1);
++	GPU_STEP("SWEET ZAP: PAS_IS_SUPPORTED(%u) -> ret %lld supported %llu\n", ZAP_PAS, (long long)rc,
++	    (unsigned long long)r1);
++	if (rc != 0 || r1 == 0) {
++		return;
++	}
++	/* Loadable segments: PT_LOAD, memsz != 0, not the hash segment (type 2 in flags 26:24). */
++	uint32_t min = ~0u, max = 0;
++	int reloc = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + i * 32);
++		if (ph[0] != 1 || ph[5] == 0 || ((ph[6] >> 24) & 7u) == 2) {
++			continue;
++		}
++		min = ph[3] < min ? ph[3] : min;
++		max = ph[3] + ph[5] > max ? ph[3] + ph[5] : max;
++		reloc |= (int)((ph[6] >> 27) & 1u);
++	}
++	max = (max + 0xfffu) & ~0xfffu;
++	if (min == ~0u || !reloc || max - min > ZAP_MEM_SIZE) {
++		printf("SWEET ZAP: segments 0x%x-0x%x reloc %d do not fit 0x%x\n", min, max, reloc, ZAP_MEM_SIZE);
++		return;
++	}
++
++	bzero(sweet_zap_meta, sizeof(sweet_zap_meta));
++	bcopy(mdt, sweet_zap_meta, mdt_size);
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_zap_meta, sizeof(sweet_zap_meta));
++	uint64_t meta_pa = ml_static_vtop((vm_offset_t)sweet_zap_meta);
++	rc = sweet_scm(1, 2u | (2u << 6), ZAP_PAS, meta_pa, 0, NULL);
++	GPU_STEP("SWEET ZAP: PAS_INIT_IMAGE(metadata pa 0x%llx, %u bytes) -> ret %lld\n",
++	    (unsigned long long)meta_pa, mdt_size, (long long)rc);
++	if (rc != 0) {
++		return;
++	}
++	rc = sweet_scm(2, 3, ZAP_PAS, ZAP_MEM_PA, max - min, NULL);
++	GPU_STEP("SWEET ZAP: PAS_MEM_SETUP(0x%x, 0x%x) -> ret %lld\n", ZAP_MEM_PA, max - min, (long long)rc);
++	if (rc != 0) {
++		return;
++	}
++	vm_offset_t mem = ml_io_map(ZAP_MEM_PA, ZAP_MEM_SIZE);
++	if (mem == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + i * 32);
++		if (ph[0] != 1 || ph[5] == 0 || ((ph[6] >> 24) & 7u) == 2) {
++			continue;
++		}
++		char pname[8] = "zap-b00";
++		pname[6] = (char)('0' + i);
++		void const *seg = NULL;
++		unsigned int seg_size = 0;
++		if (SecureDTGetProperty(node, pname, &seg, &seg_size) != kSuccess || seg_size < ph[4]) {
++			printf("SWEET ZAP: segment %s missing (%u < %u)\n", pname, seg_size, ph[4]);
++			return;
++		}
++		uint32_t off = ph[3] - min;
++		for (uint32_t k = 0; k < ph[5]; k += 4) {
++			uint32_t w = 0;
++			if (k < ph[4]) {
++				bcopy((const uint8_t *)seg + k, &w, ph[4] - k >= 4 ? 4 : ph[4] - k);
++			}
++			*(volatile uint32_t *)(mem + off + k) = w;
++		}
++		GPU_STEP("SWEET ZAP: %s 0x%x bytes -> 0x%x\n", pname, ph[4], ZAP_MEM_PA + off);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	rc = sweet_scm(5, 1, ZAP_PAS, 0, 0, NULL);
++	GPU_STEP("SWEET ZAP: PAS_AUTH_AND_RESET(%u) -> ret %lld%s\n", ZAP_PAS, (long long)rc,
++	    rc == 0 ? ": zap shader loaded, GPU may leave secure mode" : "");
++}
++
+ /* Before HFI_CTRL_INIT: a6xx_gmu_gfx_rail_on + a6xx_sptprac_enable. */
+ static int
+ sweet_gpu_rail_on(vm_offset_t gmu)
+@@ -998,6 +1135,11 @@ sweet_gpu_power_up(vm_offset_t gmu)
+ 	uint32_t back = usb_rd(g, 0x883u << 2);
+ 	GPU_STEP("SWEET GPU: RBBM_STATUS 0x%08x RBBM_INT_0_STATUS 0x%08x CP_SCRATCH0 write test %s (0x%08x)\n",
+ 	    st, irq, back == 0x5eedc0deu ? "OK" : "FAILED", back);
++	int level = 0;
++	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	if (level >= 5 && back == 0x5eedc0deu) {
++		sweet_gpu_zap();
++	}
+ }
+ 
+ static void
