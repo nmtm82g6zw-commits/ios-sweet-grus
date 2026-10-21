@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a71cab8..de3ba79 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -3607,6 +3607,49 @@ sweet_apps_smmu_dump(void)
+ 	}
+ }
+ 
++/*
++ * 0133: Wi-Fi step 1, modem (MPSS) boot through TrustZone PAS like
++ * ios-topaz (SM6225) does. On SDM670 Linux uses qcom_q6v5_mss with the MBA
++ * (self-authenticating) instead, so first find out whether TZ accepts
++ * PAS id 4 here: AOSS load_state "modem", then PAS init/mem_setup/load/
++ * auth_and_reset into modem_region 0x8b000000+0x7e00000 (grus DT), with
++ * modem.mdt/.bNN from the ADT (adt-add-gpu-fw.py --rproc modem=...).
++ * Boot-arg sweetmodem=1.
++ */
++static void
++sweet_modem_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	ud_sleep_ms(75000);
++	printf("SWEET MODEM: PAS boot starting\n");
++	(void)sweet_qmp_send("{class: image, res: load_state, name: modem, val: on}");
++	int r = sweet_pas_boot("modem", 4, 0x8b000000u, 0x7e00000u);
++	printf("SWEET MODEM: PAS boot -> %d\n", r);
++	if (r == 0) {
++		vm_offset_t m = ml_io_map_unmappable(0x86000000, 0x200000, VM_WIMG_IO);
++		for (int i = 0; m && i < 20; i++) {
++			ud_sleep_ms(1000);
++			vm_offset_t toc = m + 64 + 128 + 12 + 421 * 16;      /* SMEM_SSR_REASON_MSS0 */
++			uint32_t alloc = usb_rd(toc, 0), off = usb_rd(toc, 4);
++			char cr[64] = { 0 };
++			for (uint32_t k = 0; alloc == 1 && k < sizeof(cr) - 1; k++) {
++				uint32_t w = usb_rd(m + off, k & ~3u);
++				char c = (char)(w >> (8 * (k & 3u)));
++				if (!c) {
++					break;
++				}
++				cr[k] = (c >= 32 && c < 127) ? c : '.';
++			}
++			printf("SWEET MODEM: +%d s crash reason \"%s\"\n", i + 1, cr);
++		}
++		if (m) {
++			sweet_io_unmap(m, 0x200000);
++		}
++		sweet_smem_list(0x11d000, 0x30000, "apps<->modem");
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -4085,6 +4128,11 @@ sweet_cpufreq_start(void)
+ 	if (adsp && kernel_thread_start(sweet_adsp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	int modem = 0;
++	PE_parse_boot_argn("sweetmodem", &modem, sizeof(modem));
++	if (modem && kernel_thread_start(sweet_modem_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	int ampon = 0;
+ 	PE_parse_boot_argn("sweetamp", &ampon, sizeof(ampon));
+ 	if (ampon && kernel_thread_start(sweet_amp_thread, NULL, &thread) == KERN_SUCCESS) {
