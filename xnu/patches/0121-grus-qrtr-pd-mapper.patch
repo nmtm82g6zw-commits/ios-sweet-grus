@@ -1,0 +1,551 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a52f352..ea7f5da 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1796,6 +1796,252 @@ sweet_glink_rx32(uint32_t off)
+ 	return usb_rd(sweet_gl.rx, off % sweet_gl.rxlen);
+ }
+ 
++/* 0121: per-channel GLINK state and remote-intent pool. */
++struct sweet_glch {
++	uint32_t lcid, rcid, npool, extra;
++	int acked, hello;
++	struct { uint32_t iid, size; int busy; } pool[8];
++};
++
++/* TX_DATA on a free remote intent: {9|lcid, riid, chunk, left=0} + data. */
++static int
++sweet_glch_send(struct sweet_glch *c, const uint32_t *data, uint32_t bytes)
++{
++	uint32_t w[4 + 64];
++	unsigned k;
++	if (!c->acked || bytes > 256) {
++		return -1;
++	}
++	for (k = 0; k < c->npool && (c->pool[k].busy || c->pool[k].size < bytes); k++) {
++	}
++	if (k == c->npool) {
++		return -1;
++	}
++	w[0] = 9u | (c->lcid << 16);
++	w[1] = c->pool[k].iid;
++	w[2] = bytes;
++	w[3] = 0;
++	uint32_t nw = (bytes + 3) / 4;
++	for (uint32_t j = 0; j < nw; j++) {
++		w[4 + j] = data[j];
++	}
++	c->pool[k].busy = 1;
++	sweet_glink_tx(w, (4 + nw + 1u) & ~1u);
++	return 0;
++}
++
++#define QRTR_CTRL_PORT   0xfffffffeu
++#define SWEET_LOC_PORT   0x4000u
++
++/* QRTR v1 packet from node 1. */
++static int
++sweet_qrtr_tx(struct sweet_glch *c, uint32_t type, uint32_t sport, uint32_t dnode, uint32_t dport,
++    const void *payload, uint32_t len)
++{
++	uint32_t w[8 + 48];
++	if (len > 48 * 4) {
++		return -1;
++	}
++	w[0] = 1;
++	w[1] = type;
++	w[2] = 1;
++	w[3] = sport;
++	w[4] = 0;
++	w[5] = len;
++	w[6] = dnode;
++	w[7] = dport;
++	bzero(&w[8], (len + 3) & ~3u);
++	bcopy(payload, &w[8], len);
++	int r = sweet_glch_send(c, w, 32 + ((len + 3) & ~3u));
++	if (r) {
++		printf("SWEET QRTR: tx type %u dropped (no remote intent)\n", type);
++	}
++	return r;
++}
++
++static uint32_t
++sweet_put_str(uint8_t *b, const char *s)
++{
++	uint32_t n = (uint32_t)strlen(s);
++	b[0] = (uint8_t)n;
++	bcopy(s, b + 1, n);
++	return n + 1;
++}
++
++/* pd-mapper (qcom_pd_mapper.c, qcom,sdm670): GET_DOMAIN_LIST response. */
++static uint32_t
++sweet_pdm_domain_list(const char *service, uint32_t offset, uint8_t *b, uint32_t txn)
++{
++	static const struct { const char *svc, *dom; uint32_t inst; } db[] = {
++		{ "tms/servreg", "msm/adsp/audio_pd", 74 },
++		{ "tms/servreg", "msm/adsp/root_pd", 74 },
++		{ "tms/servreg", "msm/cdsp/root_pd", 76 },
++		{ "tms/servreg", "msm/modem/root_pd", 180 },
++		{ "tms/servreg", "msm/modem/wlan_pd", 180 },
++		{ "avs/audio", "msm/adsp/audio_pd", 74 },
++		{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
++		{ "wlan/fw", "msm/modem/wlan_pd", 180 },
++	};
++	uint32_t p = 7, total = 0, listed = 0, lp;
++	b[p++] = 0x02; b[p++] = 4; b[p++] = 0;           /* resp: result 0, error 0 */
++	b[p++] = 0; b[p++] = 0; b[p++] = 0; b[p++] = 0;
++	uint32_t tp = p;
++	p += 5;                                            /* 0x10 total_domains (u16) later */
++	b[p++] = 0x11; b[p++] = 2; b[p++] = 0; b[p++] = 1; b[p++] = 0;   /* db_rev_count 1 */
++	b[p++] = 0x12;
++	lp = p;
++	p += 2;
++	uint32_t vstart = p;
++	b[p++] = 0;                                        /* list length (u8) */
++	for (unsigned i = 0; i < sizeof(db) / sizeof(db[0]); i++) {
++		if (strcmp(db[i].svc, service) != 0) {
++			continue;
++		}
++		if (total++ < offset) {
++			continue;
++		}
++		p += sweet_put_str(b + p, db[i].dom);
++		bcopy(&db[i].inst, b + p, 4);
++		p += 4;
++		b[p++] = 0;                                    /* service_data_valid */
++		bzero(b + p, 4);
++		p += 4;
++		listed++;
++	}
++	b[vstart] = (uint8_t)listed;
++	uint32_t vlen = p - vstart;
++	b[lp] = (uint8_t)vlen;
++	b[lp + 1] = (uint8_t)(vlen >> 8);
++	b[tp] = 0x10; b[tp + 1] = 2; b[tp + 2] = 0;
++	b[tp + 3] = (uint8_t)total; b[tp + 4] = (uint8_t)(total >> 8);
++	/* QMI header: response, txn, msg 0x21, len */
++	b[0] = 2;
++	b[1] = (uint8_t)txn; b[2] = (uint8_t)(txn >> 8);
++	b[3] = 0x21; b[4] = 0;
++	b[5] = (uint8_t)(p - 7); b[6] = (uint8_t)((p - 7) >> 8);
++	printf("SWEET PDM: \"%s\" offset %u -> %u of %u domains\n", service, offset, listed, total);
++	return p;
++}
++
++static void
++sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_node, int *served)
++{
++	uint8_t pkt[512];
++	uint32_t n = chunk < sizeof(pkt) ? chunk : sizeof(pkt);
++	for (uint32_t k = 0; k < n; k += 4) {
++		uint32_t w = sweet_glink_rx32(d + k);
++		bcopy(&w, pkt + k, (n - k) < 4 ? (n - k) : 4);
++	}
++	uint32_t type, snode, sport, size, dport, confirm = 0, hl;
++	if (pkt[0] == 1 && n >= 32) {
++		uint32_t *h = (uint32_t *)(void *)pkt;
++		type = h[1]; snode = h[2]; sport = h[3]; confirm = h[4]; size = h[5]; dport = h[7];
++		hl = 32;
++	} else if (pkt[0] == 3 && n >= 16) {
++		type = pkt[1];
++		confirm = pkt[2] & 1u;
++		size = (uint32_t)pkt[4] | ((uint32_t)pkt[5] << 8) | ((uint32_t)pkt[6] << 16) | ((uint32_t)pkt[7] << 24);
++		snode = (uint32_t)pkt[8] | ((uint32_t)pkt[9] << 8);
++		sport = (uint32_t)pkt[10] | ((uint32_t)pkt[11] << 8);
++		dport = (uint32_t)pkt[14] | ((uint32_t)pkt[15] << 8);
++		if (sport == 0xffffu) {
++			sport = QRTR_CTRL_PORT;
++		}
++		if (dport == 0xffffu) {
++			dport = QRTR_CTRL_PORT;
++		}
++		hl = 16 + pkt[3];
++	} else {
++		printf("SWEET QRTR: unknown header version %u (chunk %u)\n", pkt[0], chunk);
++		return;
++	}
++	if (hl + size > n) {
++		printf("SWEET QRTR: short packet (hdr %u size %u chunk %u)\n", hl, size, n);
++		return;
++	}
++	const uint8_t *pl = pkt + hl;
++	uint32_t pw[5] = { 0 };
++	bcopy(pl, pw, size < 20 ? size : 20);
++	*adsp_node = snode;
++	switch (type) {
++	case 2: {                                  /* HELLO */
++		printf("SWEET QRTR: HELLO from node %u (v%u)%s\n", snode, pkt[0], c->hello ? ", already answered" : "");
++		if (c->hello++) {
++			break;
++		}
++		uint32_t hello[5] = { 2, 0, 0, 0, 0 };
++		sweet_qrtr_tx(c, 2, QRTR_CTRL_PORT, snode, QRTR_CTRL_PORT, hello, 20);
++		uint32_t ns[5] = { 4, 0x40, 0x101, 1, SWEET_LOC_PORT };   /* NEW_SERVER locator */
++		sweet_qrtr_tx(c, 4, QRTR_CTRL_PORT, snode, QRTR_CTRL_PORT, ns, 20);
++		printf("SWEET QRTR: HELLO + NEW_SERVER(service 0x40 ver 0x101 node 1 port 0x%x) sent\n", SWEET_LOC_PORT);
++		break;
++	}
++	case 4:                                    /* NEW_SERVER */
++		printf("SWEET QRTR: NEW_SERVER service 0x%x instance 0x%x node %u port 0x%x%s\n",
++		    pw[1], pw[2], pw[3], pw[4], pw[1] == 0x42 ? " (servreg notifier)" : "");
++		break;
++	case 5:
++		printf("SWEET QRTR: DEL_SERVER service 0x%x instance 0x%x\n", pw[1], pw[2]);
++		break;
++	case 10:
++		printf("SWEET QRTR: NEW_LOOKUP service 0x%x instance 0x%x from node %u\n", pw[1], pw[2], snode);
++		break;
++	case 7:
++	case 9:
++		break;
++	case 1: {                                  /* DATA: QMI */
++		if (size < 7) {
++			break;
++		}
++		uint32_t qtype = pl[0], txn = pl[1] | (pl[2] << 8), msg = pl[3] | (pl[4] << 8);
++		uint32_t qlen = pl[5] | (pl[6] << 8);
++		printf("SWEET QMI: from %u:0x%x to port 0x%x type %u txn %u msg 0x%x len %u\n",
++		    snode, sport, dport, qtype, txn, msg, qlen);
++		if (dport == SWEET_LOC_PORT && qtype == 0) {
++			char svc[66] = { 0 };
++			uint32_t off = 0;
++			for (uint32_t q = 7; q + 3 <= 7 + qlen && q + 3 <= size;) {
++				uint32_t tt = pl[q], tl = pl[q + 1] | (pl[q + 2] << 8);
++				if (q + 3 + tl > size) {
++					break;
++				}
++				if (tt == 0x01) {
++					uint32_t sl = tl < 65 ? tl : 65;
++					bcopy(pl + q + 3, svc, sl);
++					svc[sl] = 0;
++				} else if (tt == 0x10 && tl == 4) {
++					bcopy(pl + q + 3, &off, 4);
++				}
++				q += 3 + tl;
++			}
++			uint8_t rsp[200];
++			uint32_t rl;
++			if (msg == 0x21) {
++				printf("SWEET PDM: GET_DOMAIN_LIST \"%s\"\n", svc);
++				rl = sweet_pdm_domain_list(svc, off, rsp, txn);
++				(*served)++;
++			} else {
++				/* PFR or anything else: plain success response */
++				printf("SWEET PDM: request 0x%x (%s) acknowledged\n", msg, msg == 0x24 ? "PFR" : "?");
++				rsp[0] = 2; rsp[1] = (uint8_t)txn; rsp[2] = (uint8_t)(txn >> 8);
++				rsp[3] = (uint8_t)msg; rsp[4] = (uint8_t)(msg >> 8); rsp[5] = 7; rsp[6] = 0;
++				rsp[7] = 2; rsp[8] = 4; rsp[9] = 0; rsp[10] = rsp[11] = rsp[12] = rsp[13] = 0;
++				rl = 14;
++			}
++			sweet_qrtr_tx(c, 1, SWEET_LOC_PORT, snode, sport, rsp, rl);
++		}
++		break;
++	}
++	default:
++		printf("SWEET QRTR: type %u from %u:0x%x size %u\n", type, snode, sport, size);
++		break;
++	}
++	if (confirm) {
++		uint32_t rt[5] = { 7, 1, dport, 0, 0 };   /* RESUME_TX client = our node/port */
++		sweet_qrtr_tx(c, 7, dport, snode, sport, rt, 20);
++	}
++}
++
+ /* qcom_q6v5_pas adsp: crash_reason_smem 423 (global heap item). */
+ static void
+ sweet_adsp_crash_reason(void)
+@@ -1852,15 +2098,18 @@ sweet_glink_adsp(void)
+ 	sweet_glink_send(0, 1, 1u << 0);       /* VERSION v1, INTENT_REUSE */
+ 
+ 	/*
+-	 * 0119: a small APR script instead of two fixed commands. Remote
+-	 * intents go into a pool (INTENT adds, RX_DONE drops, RX_DONE_W_REUSE
+-	 * frees). Each step is sent when the previous one has answered (or
+-	 * timed out after 3 s): core state/versions, then the AFE (svc 4,
+-	 * Linux q6afe.c) brings up Primary MI2S RX (port 0x1000): LPASS clock
+-	 * PRI_MI2S_IBIT 1.536 MHz (AFE_SVC_CMD_SET_PARAM / CLOCK_SET),
+-	 * I2S config (16 bit, SD0, stereo, WS internal, 48 kHz) and
+-	 * DEVICE_START; the muted CS35L41 is powered while the port runs, then
+-	 * everything is stopped again. Replies carry a 32-byte APR header.
++	 * 0121: two GLINK channels.
++	 *  - "apr_audio_svc" (lcid 1): APR script as in 0119/0120.
++	 *  - "IPCRTR" (lcid 2): a minimal QRTR node 1 (Linux net/qrtr af_qrtr.c
++	 *    v1 header + ns.c HELLO/NEW_SERVER) hosting the service locator
++	 *    (SERVREG_LOCATOR 0x40, version 0x101) like the in-kernel
++	 *    qcom_pd_mapper for qcom,sdm670: GET_DOMAIN_LIST (0x21) answers
++	 *    "avs/audio" -> msm/adsp/audio_pd 74, "tms/servreg" -> all sdm670
++	 *    domains; PFR (0x24) is acknowledged. k40 showed the core (root PD)
++	 *    answering while AFE stayed silent: the audio PD most likely waits
++	 *    for this locator. AFE steps start once a domain list was served
++	 *    (+3 s) or after 20 s regardless; services announced by the ADSP
++	 *    (NEW_SERVER) are logged.
+ 	 */
+ 	enum { A_NONE, A_PINS, A_AMP_ON, A_AMP_OFF };
+ 	static const struct {
+@@ -1871,10 +2120,8 @@ sweet_glink_adsp(void)
+ 	} steps[] = {
+ 		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE" },
+ 		{ 4, A_NONE, A_NONE, 1, 0x000100e6, { 0x1000 }, "AFE probe: DEVICE_STOP (idle port)" },
+-		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE (alive after AFE probe?)" },
+ 		{ 4, A_PINS, A_NONE, 12, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 1536000, 1, 1 }, "AFE clock PRI_MI2S_IBIT on" },
+-		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE (alive after clock?)" },
+ 		{ 4, A_NONE, A_NONE, 12, 0x000100ef,
+ 		  { 0x1000u | (32u << 16), 0, 0, 0, 0x0001020c, 0x0001020d, 20, 1,
+ 		    16u | (1u << 16), 1u | (1u << 16), 48000, 0 }, "AFE PRI_MI2S_RX I2S config" },
+@@ -1884,41 +2131,35 @@ sweet_glink_adsp(void)
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 0, 1, 0 }, "AFE clock PRI_MI2S_IBIT off" },
+ 	};
+ 	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]);
+-	const uint32_t lcid = 1;
+-	uint32_t apr_rcid = 0;
+-	struct { uint32_t iid, size; int busy; } pool[8];
+-	unsigned npool = 0, step = 0;
+-	int acked = 0, opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0;
+-	for (int t = 0; t < 4000 && msgs < 600 && step < nsteps; t++) {   /* ~40 s */
+-		if (acked && !waiting) {
+-			uint32_t bytes = 20 + 4u * steps[step].n;
+-			unsigned k;
+-			for (k = 0; k < npool && (pool[k].busy || pool[k].size < bytes); k++) {
++	static const char *const chname[2] = { "apr_audio_svc", "IPCRTR" };
++	struct sweet_glch ch[2];
++	bzero(ch, sizeof(ch));
++	ch[0].lcid = 1;
++	ch[1].lcid = 2;
++	unsigned step = 0;
++	int opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0, served_t = -1, served = 0;
++	uint32_t adsp_node = 5;
++	for (int t = 0; t < 6000 && msgs < 2000 && step < nsteps; t++) {   /* ~60 s */
++		int afe_go = step < 1 || (served && t - served_t > 300) || t > 2000;
++		if (ch[0].acked && !waiting && afe_go) {
++			uint32_t w[17] = { 0 };
++			uint32_t svc = steps[step].svc, bytes = 20 + 4u * steps[step].n;
++			w[0] = 0x150u | (bytes << 16);
++			w[1] = svc | (5u << 8);
++			w[2] = svc | (4u << 8);
++			w[3] = 0x5eed0000u | step;
++			w[4] = steps[step].opcode;
++			for (uint32_t j = 0; j < steps[step].n; j++) {
++				w[5 + j] = steps[step].p[j];
+ 			}
+-			if (k < npool) {
+-				if (steps[step].before == A_PINS) {
+-					sweet_amp_pins();
+-				} else if (steps[step].before == A_AMP_OFF && start_ok) {
+-					sweet_amp_power(0);
+-				}
+-				uint32_t w[24] = { 0 };
+-				uint32_t svc = steps[step].svc;
+-				w[0] = 9u | (lcid << 16);
+-				w[1] = pool[k].iid;
+-				w[2] = bytes;
+-				w[3] = 0;
+-				w[4] = 0x150u | (bytes << 16);
+-				w[5] = svc | (5u << 8);
+-				w[6] = svc | (4u << 8);
+-				w[7] = 0x5eed0000u | step;
+-				w[8] = steps[step].opcode;
+-				for (uint32_t j = 0; j < steps[step].n; j++) {
+-					w[9 + j] = steps[step].p[j];
+-				}
+-				pool[k].busy = 1;
+-				sweet_glink_tx(w, (9 + steps[step].n + 1u) & ~1u);
+-				printf("SWEET APR: step %u %s: tx opcode 0x%x (%u bytes, riid %u)\n",
+-				    step, steps[step].what, steps[step].opcode, bytes, pool[k].iid);
++			if (steps[step].before == A_PINS) {
++				sweet_amp_pins();
++			} else if (steps[step].before == A_AMP_OFF && start_ok) {
++				sweet_amp_power(0);
++			}
++			if (sweet_glch_send(&ch[0], w, bytes) == 0) {
++				printf("SWEET APR: step %u %s: tx opcode 0x%x (%u bytes)\n",
++				    step, steps[step].what, steps[step].opcode, bytes);
+ 				waiting = 1;
+ 				wait_t = t;
+ 			}
+@@ -1937,6 +2178,12 @@ sweet_glink_adsp(void)
+ 		uint32_t w0 = sweet_glink_rx32(tail), p2 = sweet_glink_rx32(tail + 4);
+ 		uint16_t cmd = (uint16_t)w0, p1 = (uint16_t)(w0 >> 16);
+ 		uint32_t adv = 8;
++		struct sweet_glch *c = NULL;
++		for (unsigned k = 0; k < 2; k++) {
++			if (ch[k].rcid != 0 && ch[k].rcid == p1) {
++				c = &ch[k];
++			}
++		}
+ 		msgs++;
+ 		switch (cmd) {
+ 		case 0:                            /* VERSION */
+@@ -1951,71 +2198,89 @@ sweet_glink_adsp(void)
+ 			uint32_t len = p2 < 32 ? p2 : 32;
+ 			for (uint32_t k = 0; k < len; k++) {
+ 				uint32_t w = sweet_glink_rx32(tail + 8 + (k & ~3u));
+-				char c = (char)(w >> (8 * (k & 3u)));
+-				name[k] = (c >= 32 && c < 127) ? c : 0;
++				char ch8 = (char)(w >> (8 * (k & 3u)));
++				name[k] = (ch8 >= 32 && ch8 < 127) ? ch8 : 0;
+ 			}
+ 			name[len] = 0;
+ 			printf("SWEET GLINK: rx OPEN rcid %u \"%s\"\n", p1, name);
+ 			opens++;
+ 			adv = (8 + p2 + 7u) & ~7u;
+-			if (strcmp(name, "apr_audio_svc") == 0) {
+-				apr_rcid = p1;
+-				uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };
+-				sweet_glink_tx(ack, 2);
+-				uint32_t op[6] = { 2u | (lcid << 16), 14, 0, 0, 0, 0 };
+-				bcopy("apr_audio_svc", &op[2], 14);
+-				sweet_glink_tx(op, 6);
+-				printf("SWEET GLINK: apr_audio_svc: OPEN_ACK %u + OPEN lcid %u sent\n", p1, lcid);
++			for (unsigned k = 0; k < 2; k++) {
++				if (strcmp(name, chname[k]) == 0 && ch[k].rcid == 0) {
++					uint32_t nl = (uint32_t)strlen(chname[k]) + 1;
++					ch[k].rcid = p1;
++					uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };
++					sweet_glink_tx(ack, 2);
++					uint32_t op[8] = { 2u | (ch[k].lcid << 16), nl, 0, 0, 0, 0, 0, 0 };
++					bcopy(chname[k], &op[2], nl);
++					sweet_glink_tx(op, 2 + (nl + 3) / 4);
++					printf("SWEET GLINK: %s: OPEN_ACK %u + OPEN lcid %u sent\n", chname[k], p1, ch[k].lcid);
++				}
+ 			}
+ 			break;
+ 		}
+ 		case 4:                            /* OPEN_ACK of our lcid */
+ 			printf("SWEET GLINK: rx OPEN_ACK lcid %u\n", p1);
+-			if (p1 == lcid && !acked) {
+-				acked = 1;
+-				for (uint32_t iid = 1; iid <= 2; iid++) {
+-					uint32_t in[6] = { 5u | (lcid << 16), 1, 4096, iid, 0, 0 };
+-					sweet_glink_tx(in, 4);
++			for (unsigned k = 0; k < 2; k++) {
++				if (p1 == ch[k].lcid && !ch[k].acked) {
++					ch[k].acked = 1;
++					for (uint32_t iid = 1; iid <= 4; iid++) {
++						uint32_t in[4] = { 5u | (ch[k].lcid << 16), 1, 4096, iid };
++						sweet_glink_tx(in, 4);
++					}
+ 				}
+ 			}
+ 			break;
+ 		case 6:
+ 		case 14:                           /* RX_DONE(_W_REUSE) of a remote intent */
+-			if (waiting) {
+-				printf("SWEET GLINK: rx RX_DONE%s cid %u iid %u\n", cmd == 14 ? "_W_REUSE" : "", p1, p2);
+-			}
+-			for (unsigned k = 0; k < npool; k++) {
+-				if (pool[k].iid == p2 && pool[k].busy) {
+-					if (cmd == 14) {
+-						pool[k].busy = 0;
+-					} else {
+-						pool[k] = pool[--npool];
++			if (c) {
++				for (unsigned k = 0; k < c->npool; k++) {
++					if (c->pool[k].iid == p2 && c->pool[k].busy) {
++						if (cmd == 14) {
++							c->pool[k].busy = 0;
++						} else {
++							c->pool[k] = c->pool[--c->npool];
++						}
++						break;
+ 					}
+-					break;
+ 				}
+ 			}
+ 			break;
+ 		case 5:                            /* INTENT: cid, count, count x {size, iid} */
+ 			adv = (8 + p2 * 8 + 7u) & ~7u;
+-			if (p1 == apr_rcid && apr_rcid != 0) {
+-				for (uint32_t k = 0; k < p2 && npool < 8; k++) {
+-					pool[npool].size = sweet_glink_rx32(tail + 8 + 8 * k);
+-					pool[npool].iid = sweet_glink_rx32(tail + 12 + 8 * k);
+-					pool[npool].busy = 0;
+-					npool++;
++			if (c) {
++				for (uint32_t k = 0; k < p2 && c->npool < 8; k++) {
++					c->pool[c->npool].size = sweet_glink_rx32(tail + 8 + 8 * k);
++					c->pool[c->npool].iid = sweet_glink_rx32(tail + 12 + 8 * k);
++					c->pool[c->npool].busy = 0;
++					c->npool++;
+ 				}
+ 			}
+-			if (npool < 8) {
+-				printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u), pool %u\n", p1, p2,
+-				    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12), npool);
++			break;
++		case 7:                            /* RX_INTENT_REQ: cid, size */
++			printf("SWEET GLINK: rx INTENT_REQ cid %u size %u\n", p1, p2);
++			if (c) {
++				uint32_t ok[2] = { 8u | (c->lcid << 16), 1 };   /* RX_INTENT_REQ_ACK granted */
++				sweet_glink_tx(ok, 2);
++				uint32_t in[4] = { 5u | (c->lcid << 16), 1, p2 < 4096 ? 4096 : p2, 16 + (c->extra++ & 15) };
++				sweet_glink_tx(in, 4);
+ 			}
+ 			break;
+ 		case 9:
+ 		case 12: {                         /* TX_DATA(_CONT): chunk, left, data */
+-			uint32_t chunk = sweet_glink_rx32(tail + 8);
++			uint32_t chunk = sweet_glink_rx32(tail + 8), left = sweet_glink_rx32(tail + 12);
+ 			adv = (16 + chunk + 7u) & ~7u;
+-			if (p1 == apr_rcid && chunk >= 20) {
+-				uint32_t d = tail + 16;
++			uint32_t d = tail + 16;
++			if (c == &ch[1]) {
++				if (cmd == 9 && left == 0) {
++					sweet_qrtr_rx(&ch[1], d, chunk, &adsp_node, &served);
++					if (served == 1 && served_t < 0) {
++						served_t = t;
++					}
++				} else {
++					printf("SWEET QRTR: fragmented packet (chunk %u left %u) ignored\n", chunk, left);
++				}
++			} else if (c == &ch[0] && chunk >= 20) {
+ 				uint32_t hf = sweet_glink_rx32(d);
+ 				uint32_t opc = sweet_glink_rx32(d + 16), tok = sweet_glink_rx32(d + 12);
+ 				uint32_t hlen = ((hf >> 4) & 0xfu) * 4u, plen = hf >> 16;
+@@ -2030,12 +2295,6 @@ sweet_glink_adsp(void)
+ 				uint32_t a1 = nw > 1 ? sweet_glink_rx32(d + hlen + 4) : 0;
+ 				printf("SWEET APR: rx opcode 0x%x token 0x%x (%u payload words): 0x%x 0x%x\n",
+ 				    opc, tok, nw, a0, a1);
+-				if (opc == 0x00012906u) {
+-					for (uint32_t k = 0; k < a1 && 8 + 8 * k + 8 <= nw * 4u; k++) {
+-						printf("SWEET APR:   service 0x%x version 0x%x\n",
+-						    sweet_glink_rx32(d + hlen + 8 + 8 * k), sweet_glink_rx32(d + hlen + 12 + 8 * k));
+-					}
+-				}
+ 				if (waiting && tok == (0x5eed0000u | step)) {
+ 					int ok;
+ 					if (opc == 0x000110e8u) {           /* APR_BASIC_RSP_RESULT {opcode, status} */
+@@ -2055,22 +2314,27 @@ sweet_glink_adsp(void)
+ 					}
+ 					step++;
+ 				}
+-				uint32_t done[2] = { 14u | (lcid << 16), p2 };
++			} else {
++				printf("SWEET GLINK: rx DATA cid %u chunk %u\n", p1, chunk);
++			}
++			if (c) {
++				uint32_t done[2] = { 14u | (c->lcid << 16), p2 };
+ 				GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+ 				sweet_glink_tx(done, 2);
+ 				continue;
+ 			}
+-			printf("SWEET GLINK: rx DATA cid %u chunk %u\n", p1, chunk);
+ 			break;
+ 		}
++		case 15:                           /* SIGNALS */
++			break;
+ 		default:
+ 			printf("SWEET GLINK: rx cmd %u p1 %u p2 0x%x\n", cmd, p1, p2);
+ 			break;
+ 		}
+ 		GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+ 	}
+-	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; desc tx %u/%u rx %u/%u\n",
+-	    msgs, opens, step, nsteps, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
++	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; locator served %d; desc tx %u/%u rx %u/%u\n",
++	    msgs, opens, step, nsteps, served, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
+ 	sweet_adsp_crash_reason();
+ }
+ 
