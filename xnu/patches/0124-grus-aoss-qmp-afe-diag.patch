@@ -1,0 +1,150 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 17a90a3..c5c8670 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2201,8 +2201,12 @@ sweet_glink_adsp(void)
+ 	} steps[] = {
+ 		{ 3, A_NONE, A_NONE, 0, 0, 0x0001290c, { 0 }, "core GET_STATE" },
+ 		{ 4, A_NONE, A_NONE, 1, 0, 0x000100e6, { 0x1000 }, "AFE probe on apr_audio_svc: DEVICE_STOP (idle port)" },
+-		{ 4, A_NONE, A_NONE, 1, 2, 0x000100e6, { 0x1000 }, "AFE probe on apr_apps2: DEVICE_STOP (idle port)" },
+-		{ 3, A_NONE, A_NONE, 0, 2, 0x0001290c, { 0 }, "core GET_STATE on apr_apps2" },
++		{ 3, A_NONE, A_NONE, 0, 0, 0x0001292c, { 0 }, "core GET_FWK_VERSION (service list)" },
++		{ 3, A_NONE, A_NONE, 0, 0, 0x0001ffff, { 0 }, "core unknown opcode (expect error)" },
++		{ 4, A_NONE, A_NONE, 0, 0, 0x0001ffff, { 0 }, "AFE unknown opcode (alive?)" },
++		{ 7, A_NONE, A_NONE, 0, 0, 0x0001ffff, { 0 }, "ASM unknown opcode (alive?)" },
++		{ 8, A_NONE, A_NONE, 0, 0, 0x0001ffff, { 0 }, "ADM unknown opcode (alive?)" },
++		{ 0xd, A_NONE, A_NONE, 0, 0, 0x0001ffff, { 0 }, "LSM unknown opcode (alive?)" },
+ 		{ 4, A_PINS, A_NONE, 12, 9, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 1536000, 1, 1 }, "AFE clock PRI_MI2S_IBIT on" },
+ 		{ 4, A_NONE, A_NONE, 12, 9, 0x000100ef,
+@@ -2391,6 +2395,14 @@ sweet_glink_adsp(void)
+ 				printf("SWEET APR: rx on %s: opcode 0x%x token 0x%x src 0x%x dst 0x%x (%u payload words): 0x%x 0x%x\n",
+ 				    c == &ch[0] ? "apr_audio_svc" : "apr_apps2", opc, tok, sweet_glink_rx32(d + 4),
+ 				    sweet_glink_rx32(d + 8), nw, a0, a1);
++				for (uint32_t k = 2; k < nw && k < 34; k += 8) {
++					uint32_t v[8] = { 0 };
++					for (uint32_t j = 0; j < 8 && k + j < nw; j++) {
++						v[j] = sweet_glink_rx32(d + hlen + 4u * (k + j));
++					}
++					printf("SWEET APR:   +%02u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++					    k * 4u, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++				}
+ 				if (steps[step].svc == 4 && waiting && tok == (0x5eed0000u | step)) {
+ 					afe_ch = (c == &ch[0]) ? 0 : 2;
+ 				}
+@@ -3041,12 +3053,115 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0124: AOSS QMP (Linux qcom_aoss.c, sdm845 aoss_qmp: message RAM
++ * 0x0c300000, doorbell apss_shared 0x1799000c bit 0). qcom_q6v5_prepare
++ * sends "{class: image, res: load_state, name: adsp, val: on}" before the
++ * ADSP is authenticated; without it the AOP may keep LPASS resources off,
++ * which would leave the audio PD services (AFE) unable to start.
++ * Polled, no interrupt; every step is logged.
++ */
++static vm_offset_t sweet_qmp_ram, sweet_qmp_db;
++static uint32_t sweet_qmp_off;
++
++static void
++sweet_qmp_kick(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)sweet_qmp_db = 1u;
++}
++
++static int
++sweet_qmp_wait(uint32_t reg, uint32_t want, int eq)
++{
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = usb_rd(sweet_qmp_ram, reg);
++		if ((v == want) == (eq != 0)) {
++			return 0;
++		}
++		ud_sleep_ms(1);
++	}
++	return -1;
++}
++
++static int
++sweet_qmp_open(void)
++{
++	if (sweet_qmp_off) {
++		return 0;
++	}
++	sweet_qmp_ram = ml_io_map(0x0c300000, 0x4000);
++	sweet_qmp_db = ml_io_map(0x1799000c, 4);
++	if (!sweet_qmp_ram || !sweet_qmp_db) {
++		return -1;
++	}
++	vm_offset_t r = sweet_qmp_ram;
++	printf("SWEET QMP: magic %#x ver %u ucore link %#x/%#x ch %#x/%#x mcore link %#x/%#x ch %#x/%#x mbox %#x+%#x\n",
++	    usb_rd(r, 0), usb_rd(r, 4), usb_rd(r, 0xc), usb_rd(r, 0x10), usb_rd(r, 0x14), usb_rd(r, 0x18),
++	    usb_rd(r, 0x24), usb_rd(r, 0x28), usb_rd(r, 0x2c), usb_rd(r, 0x30), usb_rd(r, 0x38), usb_rd(r, 0x34));
++	if (usb_rd(r, 0) != 0x4d41494cu || usb_rd(r, 4) != 1 || usb_rd(r, 0x34) == 0) {
++		printf("SWEET QMP: no usable mailbox\n");
++		return -1;
++	}
++	uint32_t off = usb_rd(r, 0x38);
++	*(volatile uint32_t *)(r + 0x10) = usb_rd(r, 0xc);    /* ack ucore link */
++	*(volatile uint32_t *)(r + 0x24) = 0xffffu;            /* mcore link up */
++	sweet_qmp_kick();
++	if (sweet_qmp_wait(0x28, 0xffffu, 1)) {
++		printf("SWEET QMP: AOP didn't ack link (%#x)\n", usb_rd(r, 0x28));
++		return -1;
++	}
++	*(volatile uint32_t *)(r + 0x2c) = 0xffffu;            /* mcore channel up */
++	sweet_qmp_kick();
++	if (sweet_qmp_wait(0x14, 0xffffu, 1)) {
++		printf("SWEET QMP: AOP didn't open channel (%#x)\n", usb_rd(r, 0x14));
++		return -1;
++	}
++	*(volatile uint32_t *)(r + 0x18) = 0xffffu;            /* ack ucore channel */
++	sweet_qmp_kick();
++	if (sweet_qmp_wait(0x30, 0xffffu, 1)) {
++		printf("SWEET QMP: AOP didn't ack channel (%#x)\n", usb_rd(r, 0x30));
++		return -1;
++	}
++	sweet_qmp_off = off;
++	printf("SWEET QMP: channel open, mailbox at %#x\n", off);
++	return 0;
++}
++
++static int
++sweet_qmp_send(const char *msg)
++{
++	if (sweet_qmp_open()) {
++		return -1;
++	}
++	uint32_t buf[16] = { 0 };          /* QMP_MSG_LEN 64 */
++	uint32_t n = (uint32_t)strlen(msg);
++	if (n >= sizeof(buf)) {
++		return -1;
++	}
++	bcopy(msg, buf, n);
++	vm_offset_t m = sweet_qmp_ram + sweet_qmp_off;
++	for (unsigned i = 0; i < 16; i++) {
++		*(volatile uint32_t *)(m + 4 + 4 * i) = buf[i];
++	}
++	*(volatile uint32_t *)m = sizeof(buf);
++	(void)usb_rd(m, 0);
++	sweet_qmp_kick();
++	int r = sweet_qmp_wait(sweet_qmp_off, 0, 1);
++	if (r) {
++		*(volatile uint32_t *)m = 0;
++	}
++	printf("SWEET QMP: \"%s\" -> %s\n", msg, r ? "TIMEOUT" : "acked");
++	return r;
++}
++
+ static void
+ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	ud_sleep_ms(60000);
+ 	printf("SWEET ADSP: boot starting\n");
+ 	sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp before");
++	(void)sweet_qmp_send("{class: image, res: load_state, name: adsp, val: on}");
+ 	if (sweet_pas_boot("adsp", 1, 0x93e00000u, 0x2200000u) == 0) {
+ 		ud_sleep_ms(2000);
+ 		sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp");
