@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fd6f01d..17a90a3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2192,31 +2192,35 @@ sweet_glink_adsp(void)
+ 	 *    (or after 30 s regardless).
+ 	 */
+ 	enum { A_NONE, A_PINS, A_AMP_ON, A_AMP_OFF };
++	/* chn: 0 apr_audio_svc, 2 apr_apps2, 9 = whichever channel the AFE answered on */
+ 	static const struct {
+-		uint8_t svc, before, after, n;
++		uint8_t svc, before, after, n, chn;
+ 		uint32_t opcode;
+ 		uint32_t p[12];
+ 		const char *what;
+ 	} steps[] = {
+-		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE" },
+-		{ 4, A_NONE, A_NONE, 1, 0x000100e6, { 0x1000 }, "AFE probe: DEVICE_STOP (idle port)" },
+-		{ 4, A_PINS, A_NONE, 12, 0x000100f3,
++		{ 3, A_NONE, A_NONE, 0, 0, 0x0001290c, { 0 }, "core GET_STATE" },
++		{ 4, A_NONE, A_NONE, 1, 0, 0x000100e6, { 0x1000 }, "AFE probe on apr_audio_svc: DEVICE_STOP (idle port)" },
++		{ 4, A_NONE, A_NONE, 1, 2, 0x000100e6, { 0x1000 }, "AFE probe on apr_apps2: DEVICE_STOP (idle port)" },
++		{ 3, A_NONE, A_NONE, 0, 2, 0x0001290c, { 0 }, "core GET_STATE on apr_apps2" },
++		{ 4, A_PINS, A_NONE, 12, 9, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 1536000, 1, 1 }, "AFE clock PRI_MI2S_IBIT on" },
+-		{ 4, A_NONE, A_NONE, 12, 0x000100ef,
++		{ 4, A_NONE, A_NONE, 12, 9, 0x000100ef,
+ 		  { 0x1000u | (32u << 16), 0, 0, 0, 0x0001020c, 0x0001020d, 20, 1,
+ 		    16u | (1u << 16), 1u | (1u << 16), 48000, 0 }, "AFE PRI_MI2S_RX I2S config" },
+-		{ 4, A_NONE, A_AMP_ON, 1, 0x000100e5, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_START" },
+-		{ 4, A_AMP_OFF, A_NONE, 1, 0x000100e6, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_STOP" },
+-		{ 4, A_NONE, A_NONE, 12, 0x000100f3,
++		{ 4, A_NONE, A_AMP_ON, 1, 9, 0x000100e5, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_START" },
++		{ 4, A_AMP_OFF, A_NONE, 1, 9, 0x000100e6, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_STOP" },
++		{ 4, A_NONE, A_NONE, 12, 9, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 0, 1, 0 }, "AFE clock PRI_MI2S_IBIT off" },
+ 	};
+ 	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]);
+-	static const char *const chname[2] = { "apr_audio_svc", "IPCRTR" };
+-	struct sweet_glch ch[2];
++	static const char *const chname[3] = { "apr_audio_svc", "IPCRTR", "apr_apps2" };
++	struct sweet_glch ch[3];
+ 	bzero(ch, sizeof(ch));
+ 	ch[0].lcid = 1;
+ 	ch[1].lcid = 2;
+-	unsigned step = 0;
++	ch[2].lcid = 3;
++	unsigned step = 0, afe_ch = 0;
+ 	int opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0, up_t = -1;
+ 	struct sweet_qrtr_st qs;
+ 	bzero(&qs, sizeof(qs));
+@@ -2229,7 +2233,13 @@ sweet_glink_adsp(void)
+ 			up_t = t;
+ 		}
+ 		int afe_go = step < 1 || (up_t >= 0 && t - up_t > 100) || t > 3000;
+-		if (ch[0].acked && !waiting && afe_go) {
++		unsigned sc = steps[step].chn == 9 ? afe_ch : steps[step].chn;
++		if (!waiting && afe_go && steps[step].chn == 2 && !ch[2].acked && t > 3500) {
++			printf("SWEET APR: step %u %s: apr_apps2 not open, skipped\n", step, steps[step].what);
++			step++;
++			continue;
++		}
++		if (ch[sc].acked && !waiting && afe_go) {
+ 			uint32_t w[17] = { 0 };
+ 			uint32_t svc = steps[step].svc, bytes = 20 + 4u * steps[step].n;
+ 			w[0] = 0x150u | (bytes << 16);
+@@ -2245,9 +2255,9 @@ sweet_glink_adsp(void)
+ 			} else if (steps[step].before == A_AMP_OFF && start_ok) {
+ 				sweet_amp_power(0);
+ 			}
+-			if (sweet_glch_send(&ch[0], w, bytes) == 0) {
+-				printf("SWEET APR: step %u %s: tx opcode 0x%x (%u bytes)\n",
+-				    step, steps[step].what, steps[step].opcode, bytes);
++			if (sweet_glch_send(&ch[sc], w, bytes) == 0) {
++				printf("SWEET APR: step %u %s: tx opcode 0x%x (%u bytes) on %s\n",
++				    step, steps[step].what, steps[step].opcode, bytes, chname[sc]);
+ 				waiting = 1;
+ 				wait_t = t;
+ 			}
+@@ -2267,7 +2277,7 @@ sweet_glink_adsp(void)
+ 		uint16_t cmd = (uint16_t)w0, p1 = (uint16_t)(w0 >> 16);
+ 		uint32_t adv = 8;
+ 		struct sweet_glch *c = NULL;
+-		for (unsigned k = 0; k < 2; k++) {
++		for (unsigned k = 0; k < 3; k++) {
+ 			if (ch[k].rcid != 0 && ch[k].rcid == p1) {
+ 				c = &ch[k];
+ 			}
+@@ -2293,7 +2303,7 @@ sweet_glink_adsp(void)
+ 			printf("SWEET GLINK: rx OPEN rcid %u \"%s\"\n", p1, name);
+ 			opens++;
+ 			adv = (8 + p2 + 7u) & ~7u;
+-			for (unsigned k = 0; k < 2; k++) {
++			for (unsigned k = 0; k < 3; k++) {
+ 				if (strcmp(name, chname[k]) == 0 && ch[k].rcid == 0) {
+ 					uint32_t nl = (uint32_t)strlen(chname[k]) + 1;
+ 					ch[k].rcid = p1;
+@@ -2309,7 +2319,7 @@ sweet_glink_adsp(void)
+ 		}
+ 		case 4:                            /* OPEN_ACK of our lcid */
+ 			printf("SWEET GLINK: rx OPEN_ACK lcid %u\n", p1);
+-			for (unsigned k = 0; k < 2; k++) {
++			for (unsigned k = 0; k < 3; k++) {
+ 				if (p1 == ch[k].lcid && !ch[k].acked) {
+ 					ch[k].acked = 1;
+ 					for (uint32_t iid = 1; iid <= 4; iid++) {
+@@ -2365,7 +2375,7 @@ sweet_glink_adsp(void)
+ 				} else {
+ 					printf("SWEET QRTR: fragmented packet (chunk %u left %u) ignored\n", chunk, left);
+ 				}
+-			} else if (c == &ch[0] && chunk >= 20) {
++			} else if ((c == &ch[0] || c == &ch[2]) && chunk >= 20) {
+ 				uint32_t hf = sweet_glink_rx32(d);
+ 				uint32_t opc = sweet_glink_rx32(d + 16), tok = sweet_glink_rx32(d + 12);
+ 				uint32_t hlen = ((hf >> 4) & 0xfu) * 4u, plen = hf >> 16;
+@@ -2378,8 +2388,12 @@ sweet_glink_adsp(void)
+ 				uint32_t nw = (plen - hlen) / 4u;
+ 				uint32_t a0 = nw > 0 ? sweet_glink_rx32(d + hlen) : 0;
+ 				uint32_t a1 = nw > 1 ? sweet_glink_rx32(d + hlen + 4) : 0;
+-				printf("SWEET APR: rx opcode 0x%x token 0x%x (%u payload words): 0x%x 0x%x\n",
+-				    opc, tok, nw, a0, a1);
++				printf("SWEET APR: rx on %s: opcode 0x%x token 0x%x src 0x%x dst 0x%x (%u payload words): 0x%x 0x%x\n",
++				    c == &ch[0] ? "apr_audio_svc" : "apr_apps2", opc, tok, sweet_glink_rx32(d + 4),
++				    sweet_glink_rx32(d + 8), nw, a0, a1);
++				if (steps[step].svc == 4 && waiting && tok == (0x5eed0000u | step)) {
++					afe_ch = (c == &ch[0]) ? 0 : 2;
++				}
+ 				if (waiting && tok == (0x5eed0000u | step)) {
+ 					int ok;
+ 					if (opc == 0x000110e8u) {           /* APR_BASIC_RSP_RESULT {opcode, status} */
