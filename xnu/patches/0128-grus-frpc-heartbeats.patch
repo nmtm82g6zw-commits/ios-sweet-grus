@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 4749af0..f11ad7f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2448,6 +2448,16 @@ sweet_glink_adsp(void)
+ 		}
+ 		/* 0126: create the audio PD static process once audio_pd is UP */
+ 		if (frpc == 0 && up_t >= 0 && ch[3].acked) {
++			frpc = 9;                                  /* 0128: 5 s of heartbeats first */
++			frpc_t = t;
++		}
++		if (frpc == 9 && (t - frpc_t) % 100 == 0) {
++			printf("SWEET FRPC: CREATE_STATIC in %d s\n", 5 - (t - frpc_t) / 100);
++		}
++		if (frpc == 9 && t - frpc_t >= 500) {
++			frpc = 0;
++		}
++		if (frpc == 0 && up_t >= 0 && ch[3].acked && t > 0 && frpc_t > 0) {
+ 			if (!sweet_rheap_ok) {
+ 				printf("SWEET FRPC: no remote heap, CREATE_STATIC skipped\n");
+ 				frpc = 3;
+@@ -2477,6 +2487,9 @@ sweet_glink_adsp(void)
+ 				}
+ 			}
+ 		}
++		if (frpc == 1 && (t - frpc_t) % 100 == 50) {
++			printf("SWEET FRPC: waiting for the reply, %d s\n", (t - frpc_t) / 100);
++		}
+ 		if (frpc == 1 && t - frpc_t > 500) {
+ 			printf("SWEET FRPC: no answer to CREATE_STATIC in 5 s\n");
+ 			frpc = 3;
+@@ -3490,6 +3503,12 @@ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 	static const uint16_t adsp_sids[] = { 0x1801, 0x1803, 0x1804, 0x1805, 0x1806 };
+ 	(void)sweet_apps_smmu_identity(adsp_sids, 5, "ADSP audio/FastRPC");
+ 	sweet_remote_heap();
++	/* 0128: k47's USB log stopped shortly before CREATE_STATIC; heartbeats
++	 * show whether the SMMU/heap setup alone already disturbs USB. */
++	for (int hb = 1; hb <= 8; hb++) {
++		printf("SWEET ADSP: heartbeat %d/8 after SMMU identity + heap assign\n", hb);
++		ud_sleep_ms(1000);
++	}
+ 	if (sweet_pas_boot("adsp", 1, 0x93e00000u, 0x2200000u) == 0) {
+ 		ud_sleep_ms(2000);
+ 		sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp");
