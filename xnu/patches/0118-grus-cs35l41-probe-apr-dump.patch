@@ -1,0 +1,470 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 4b24798..13f7269 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -13,6 +13,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -1771,6 +1772,22 @@ sweet_glink_send(uint16_t cmd, uint16_t p1, uint32_t p2)
+ 	sweet_glink_kick();
+ }
+ 
++/* qcom_glink_smem tx_write: words at head, wrap, head 8-aligned, then kick */
++static void
++sweet_glink_tx(const uint32_t *w, uint32_t words)
++{
++	uint32_t head = GL_DESC(1);
++	for (uint32_t i = 0; i < words; i++) {
++		*(volatile uint32_t *)(sweet_gl.tx + head) = w[i];
++		head = (head + 4) % sweet_gl.txlen;
++	}
++	head = (head + 7u) & ~7u;
++	head %= sweet_gl.txlen;
++	__asm__ volatile("dsb sy" ::: "memory");
++	GL_DESC(1) = head;
++	sweet_glink_kick();
++}
++
+ static uint32_t
+ sweet_glink_rx32(uint32_t off)
+ {
+@@ -1804,8 +1821,40 @@ sweet_glink_adsp(void)
+ 	GL_DESC(1) = 0;                        /* tx head */
+ 	sweet_glink_send(0, 1, 1u << 0);       /* VERSION v1, INTENT_REUSE */
+ 
++	/*
++	 * Step 3 (0117): APR on "apr_audio_svc" (Linux qcom_glink_native open /
++	 * intent / tx_data / rx_done, drivers/soc/qcom/apr.c, q6core): answer
++	 * the ADSP's OPEN with OPEN_ACK and our own OPEN (lcid 1), advertise two
++	 * 4 KiB RX intents once our OPEN is acked, then on a remote intent send
++	 * AVCS_CMD_ADSP_EVENT_GET_STATE (0x1290c) and AVCS_GET_VERSIONS
++	 * (0x12905) to the core service (svc 3, domain apps 5 -> adsp 4) and
++	 * log the answers; RX_DONE_W_REUSE returns our intents.
++	 */
++	const uint32_t lcid = 1;
++	uint32_t apr_rcid = 0, riid = 0, rsize = 0, step = 0;
++	int acked = 0, ravail = 0;
+ 	int opens = 0, msgs = 0;
+-	for (int t = 0; t < 1000 && msgs < 200; t++) {   /* ~10 s */
++	for (int t = 0; t < 1500 && msgs < 400; t++) {   /* ~15 s */
++		if (acked && ravail && step < 2) {
++			static const uint32_t ops[2] = { 0x0001290cu, 0x00012905u };
++			uint32_t w[10];
++			w[0] = 9u | (lcid << 16);      /* TX_DATA, lcid */
++			w[1] = riid;
++			w[2] = 20;                     /* chunk */
++			w[3] = 0;                      /* left */
++			w[4] = 0x150u | (20u << 16);   /* APR hdr_field (SEQ_CMD, 5 words), pkt_size */
++			w[5] = 3u | (5u << 8);         /* src svc core, domain apps, port 0 */
++			w[6] = 3u | (4u << 8);         /* dest svc core, domain adsp, port 0 */
++			w[7] = 0x5eed0000u | step;     /* token */
++			w[8] = ops[step];
++			w[9] = 0;                      /* pad to 8 */
++			if (rsize >= 20) {
++				sweet_glink_tx(w, 10);
++				printf("SWEET APR: tx opcode 0x%x on riid %u\n", ops[step], riid);
++				ravail = 0;
++				step++;
++			}
++		}
+ 		uint32_t head = GL_DESC(3), tail = GL_DESC(2);
+ 		if (head == tail) {
+ 			ud_sleep_ms(10);
+@@ -1835,16 +1884,84 @@ sweet_glink_adsp(void)
+ 			printf("SWEET GLINK: rx OPEN rcid %u \"%s\"\n", p1, name);
+ 			opens++;
+ 			adv = (8 + p2 + 7u) & ~7u;
++			if (strcmp(name, "apr_audio_svc") == 0) {
++				apr_rcid = p1;
++				uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };   /* OPEN_ACK rcid */
++				sweet_glink_tx(ack, 2);
++				uint32_t op[6] = { 2u | (lcid << 16), 14, 0, 0, 0, 0 }; /* OPEN lcid, len 14 */
++				bcopy("apr_audio_svc", &op[2], 14);
++				sweet_glink_tx(op, 6);
++				printf("SWEET GLINK: apr_audio_svc: OPEN_ACK %u + OPEN lcid %u sent\n", p1, lcid);
++			}
+ 			break;
+ 		}
++		case 4:                            /* OPEN_ACK of our lcid */
++			printf("SWEET GLINK: rx OPEN_ACK lcid %u\n", p1);
++			if (p1 == lcid && !acked) {
++				acked = 1;
++				for (uint32_t iid = 1; iid <= 2; iid++) {
++					uint32_t in[6] = { 5u | (lcid << 16), 1, 4096, iid, 0, 0 };
++					sweet_glink_tx(in, 4);
++				}
++			}
++			break;
++		case 6:
++		case 14:                           /* RX_DONE(_W_REUSE) of a remote intent */
++			if (p1 == lcid || p1 == apr_rcid) {
++				if (cmd == 14 && p2 == riid) {
++					ravail = 1;
++				}
++			}
++			printf("SWEET GLINK: rx RX_DONE%s cid %u iid %u\n", cmd == 14 ? "_W_REUSE" : "", p1, p2);
++			break;
+ 		case 5:                            /* INTENT: cid, count, count x {size, iid} */
+ 			adv = (8 + p2 * 8 + 7u) & ~7u;
+-			printf("SWEET GLINK: rx INTENT cid %u count %u\n", p1, p2);
++			if (p1 == apr_rcid && apr_rcid != 0 && p2 >= 1) {
++				rsize = sweet_glink_rx32(tail + 8);
++				riid = sweet_glink_rx32(tail + 12);
++				ravail = 1;
++			}
++			printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u)\n", p1, p2,
++			    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12));
+ 			break;
+ 		case 9:
+ 		case 12: {                         /* TX_DATA(_CONT): chunk, left, data */
+ 			uint32_t chunk = sweet_glink_rx32(tail + 8);
+ 			adv = (16 + chunk + 7u) & ~7u;
++			if (p1 == apr_rcid && chunk >= 20) {
++				uint32_t d = tail + 16;
++				uint32_t hf = sweet_glink_rx32(d);
++				uint32_t opc = sweet_glink_rx32(d + 16), tok = sweet_glink_rx32(d + 12);
++				uint32_t hlen = ((hf >> 4) & 0xfu) * 4u, plen = hf >> 16;
++				if (hlen < 20 || hlen > chunk) {
++					hlen = 20;
++				}
++				if (plen < hlen || plen > chunk) {
++					plen = chunk;
++				}
++				uint32_t nw = (plen - hlen) / 4u;
++				uint32_t last = nw ? sweet_glink_rx32(d + hlen + 4u * (nw - 1u)) : 0;
++				/*
++				 * 0118: the k37 log showed 16 payload bytes for GET_STATE
++				 * (0x4000102 0x6d22542 0 1); dump everything raw instead of
++				 * guessing a layout, and judge GET_STATE by its last word.
++				 */
++				printf("SWEET APR: rx opcode 0x%x token 0x%x hdr 0x%x (hlen %u pkt %u chunk %u)%s\n",
++				    opc, tok, hf, hlen, plen, chunk,
++				    opc == 0x0001290du ? (last == 1 ? " ADSP READY" : " adsp not ready") : "");
++				for (uint32_t k = 0; k < nw && k < 32; k += 8) {
++					uint32_t v[8] = { 0 };
++					for (uint32_t j = 0; j < 8 && k + j < nw; j++) {
++						v[j] = sweet_glink_rx32(d + hlen + 4u * (k + j));
++					}
++					printf("SWEET APR:   +%02u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++					    k * 4u, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++				}
++				uint32_t done[2] = { 14u | (lcid << 16), p2 };      /* RX_DONE_W_REUSE liid */
++				GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
++				sweet_glink_tx(done, 2);
++				continue;
++			}
+ 			printf("SWEET GLINK: rx DATA cid %u chunk %u\n", p1, chunk);
+ 			break;
+ 		}
+@@ -1858,6 +1975,294 @@ sweet_glink_adsp(void)
+ 	    msgs, opens, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
+ }
+ 
++/*
++ * 0118: speaker amplifier probe. grus dtbo (SDM710 MTP Grus overlay):
++ * cs35l41@40 on qupv3_se7_i2c = /soc/i2c@89c000 (QUP wrapper0 SE7),
++ * pins gpio93/94 function qup7 (mux 3, 2 mA, no bias), reset gpio95
++ * (active low), irq gpio96. Clocks (gcc-sdm845.c, qcom,gcc-sdm670):
++ * wrap0 m-ahb vote 0x5200c BIT(6) halt 0x17004, s-ahb BIT(7) 0x17008,
++ * core/core_2x BIT(8)/BIT(9), SE7 BIT(17) halt 0x17880, RCG 0x17884.
++ * TLMM SOUTH tile = 0x03400000 + 0x900000. CS35L41 uses 32-bit big
++ * endian register addresses and values; DEVID (0x0) = 0x35a40.
++ * GENI programming mirrors sweet_touch.c (Linux i2c-qcom-geni FIFO mode),
++ * but TX may carry up to 8 bytes (address + value).
++ */
++#define AMP_SE_PA     0x0089c000u
++#define AMP_GCC_PA    0x00100000u
++#define AMP_TLMM_PA   0x03d5c000u     /* SOUTH + pin 92 */
++#define AMP_TLMM_PIN0 92u
++#define AMP_RCG       0x17884u
++#define AMP_ADDR      0x40u
++#define AMP_RST_PIN   95u
++#define AMP_IRQ_PIN   96u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	uint32_t sent, got;
++} amp;
++
++static uint32_t
++amp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++amp_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++amp_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(amp_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++amp_gpio(unsigned pin, unsigned mux, bool out, bool high)
++{
++	uint32_t off = (pin - AMP_TLMM_PIN0) * 0x1000u;
++	if (out) {
++		amp_wr(amp.gpio, off + 4, (amp_rd(amp.gpio, off + 4) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = amp_rd(amp.gpio, off) & ~0x3ffu;
++	cfg |= (mux << 2) | (out ? 0x200u : 0u);   /* no pull, 2 mA */
++	amp_wr(amp.gpio, off, cfg);
++}
++
++static bool
++amp_clocks(void)
++{
++	uint32_t mask = (0x0fu << 6) | (1u << 17);
++	amp_wr(amp.gcc, 0x5200c, amp_rd(amp.gcc, 0x5200c) | mask);
++	uint32_t cfg = amp_rd(amp.gcc, AMP_RCG + 4u), dfs = amp_rd(amp.gcc, AMP_RCG + 0x14u);
++	printf("SWEET AMP: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    amp_rd(amp.gcc, 0x5200c), amp_rd(amp.gcc, AMP_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		cfg = amp_rd(amp.gcc, AMP_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET AMP: DFS level0=%#x is not XO/1\n", cfg);
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* XO, div 1: 19.2 MHz */
++		amp_wr(amp.gcc, AMP_RCG + 4u, cfg);
++		amp_wr(amp.gcc, AMP_RCG, amp_rd(amp.gcc, AMP_RCG) | 1u);
++		if (!amp_wait_clear(amp.gcc, AMP_RCG, 1u)) {
++			printf("SWEET AMP: RCG update timeout\n");
++			return false;
++		}
++	}
++	static const uint32_t br[] = { 0x17004, 0x17008, 0x1700c, 0x17010, 0x17014, 0x17880 };
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(br) / sizeof(br[0]); ++i) {
++		bool on = amp_wait_clear(amp.gcc, br[i], 1u << 31);
++		printf("SWEET AMP: branch %#x = %#x%s\n", br[i], amp_rd(amp.gcc, br[i]), on ? "" : " (halted)");
++		if (!on && (i < 2 || i == 5)) {
++			ok = false;
++		}
++	}
++	return ok;
++}
++
++static bool
++amp_se_init(void)
++{
++	vm_offset_t se = amp.se;
++	uint32_t fw = amp_rd(se, 0x68), tx = amp_rd(se, 0xe24), rx = amp_rd(se, 0xe28);
++	printf("SWEET AMP: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, amp_rd(se, 0x40), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u || ((tx >> 24) & 0x3fu) != 32u ||
++	    ((rx >> 24) & 0x3fu) != 32u || ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SWEET AMP: SE7 has no I2C firmware / 32-bit FIFOs\n");
++		return false;
++	}
++	if (amp_rd(se, 0x40) & 0x1001u) {
++		printf("SWEET AMP: SE7 busy\n");
++		return false;
++	}
++	amp_wr(se, 0xe18, 0);
++	amp_wr(se, 0xe1c, 0);
++	amp_wr(se, 0x644, 0);
++	amp_wr(se, 0x618, 0xffffffffu);
++	amp_wr(se, 0x648, 0xffffffffu);
++	amp_wr(se, 0x258, 0);
++	amp_wr(se, 0x28, amp_rd(se, 0x28) | 0x7fu);
++	amp_wr(se, 0xe30, amp_rd(se, 0xe30) | 0x0fu);
++	amp_wr(se, 0x24, 0x7f);
++	amp_wr(se, 0x20, 1);
++	amp_wr(se, 0x7c, 0);
++	amp_wr(se, 0x48, (7u << 4) | 1u);
++	amp_wr(se, 0x278, (10u << 20) | (11u << 10) | 26u);   /* 100 kHz */
++	amp_wr(se, 0x254, 0);
++	amp_wr(se, 0x260, 0x0007f8feu);
++	amp_wr(se, 0x264, 0x000ffefeu);
++	amp_wr(se, 0x284, 0x0007f8feu);
++	amp_wr(se, 0x288, 0x000ffefeu);
++	amp_wr(se, 0x80c, 0);
++	amp_wr(se, 0x810, 0);
++	amp_wr(se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	amp_wr(se, 0x614, 0x3fu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) |
++	    (3u << 24) | (3u << 26) | (3u << 28) | (1u << 30));
++	return (amp_rd(se, 0x804) & 0x1ffffffu) == 0 && (amp_rd(se, 0x800) & 0xfffffffu) == 0;
++}
++
++static void
++amp_abort(void)
++{
++	amp_wr(amp.se, 0x604, 2);
++	for (unsigned i = 0; i < 5000 && !(amp_rd(amp.se, 0x610) & (1u << 5)); ++i) {
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (amp_rd(amp.se, 0x804) & 0x1ffffffu); ++i) {
++		(void)amp_rd(amp.se, 0x780);
++	}
++	amp_wr(amp.se, 0x618, 0xffffffffu);
++}
++
++/* One FIFO message: TX <= 8 bytes or RX <= 16 bytes. */
++static int
++amp_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	const uint32_t errs = 0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) |
++	    (3u << 24) | (3u << 28);
++	vm_offset_t se = amp.se;
++	if (nt > 8 || nr > 16 || (nt && nr) || (!nt && !nr)) {
++		return EINVAL;
++	}
++	if (!amp_wait_clear(se, 0x40, 1u)) {
++		return EBUSY;
++	}
++	amp.sent = amp.got = 0;
++	amp_wr(se, 0x618, 0xffffffffu);
++	amp_wr(se, 0x80c, nt ? 1u : 0u);
++	amp_wr(se, nr ? 0x270 : 0x26c, nr ? nr : nt);
++	amp_wr(se, 0x600, ((nr ? 2u : 1u) << 27) | ((uint32_t)AMP_ADDR << 9) | (stretch ? 4u : 0u));
++	uint32_t irq = 0;
++	for (unsigned i = 0; i < 20000; ++i) {
++		irq = amp_rd(se, 0x610);
++		if (irq & errs) {
++			for (unsigned j = 0; j < 5000 && !(irq & 1u); ++j) {
++				delay(1);
++				irq = amp_rd(se, 0x610);
++			}
++			int err = (irq & (1u << 10)) ? ENXIO : EIO;
++			if ((irq & 1u) && !(amp_rd(se, 0x40) & 1u)) {
++				amp_wr(se, 0x618, irq);
++				return err;
++			}
++			amp_abort();
++			return err;
++		}
++		if (nt && !amp.sent && (irq & (1u << 30))) {
++			for (unsigned w = 0; w < nt; w += 4) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w + j < nt; ++j) {
++					word |= (uint32_t)tx[w + j] << (8u * j);
++				}
++				amp_wr(se, 0x700, word);
++			}
++			amp.sent = nt;
++			amp_wr(se, 0x80c, 0);
++		}
++		uint32_t count = amp_rd(se, 0x804) & 0x1ffffffu;
++		while (count-- && amp.got < nr) {
++			uint32_t word = amp_rd(se, 0x780);
++			for (unsigned j = 0; j < 4 && amp.got < nr; ++j) {
++				rx[amp.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & 1u) {
++			amp_wr(se, 0x618, irq);
++			return (amp.got == nr && amp.sent == nt) ? 0 : EIO;
++		}
++		amp_wr(se, 0x618, irq & ((3u << 26) | (1u << 30)));
++		delay(1);
++	}
++	printf("SWEET AMP: timeout irq=%#x status=%#x\n", irq, amp_rd(se, 0x40));
++	amp_abort();
++	return ETIMEDOUT;
++}
++
++static int
++amp_read(uint32_t reg, uint32_t *val)
++{
++	uint8_t a[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg };
++	uint8_t b[4] = { 0 };
++	int err = amp_msg(a, 4, NULL, 0, true);
++	if (!err) {
++		err = amp_msg(NULL, 0, b, 4, false);
++	}
++	*val = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
++	return err;
++}
++
++static void
++sweet_amp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	ud_sleep_ms(50000);
++	printf("SWEET AMP: probe starting\n");
++	amp.se = ml_io_map(AMP_SE_PA, 0x4000);
++	amp.gcc = ml_io_map(AMP_GCC_PA, 0x60000);
++	amp.gpio = ml_io_map(AMP_TLMM_PA, 0x8000);
++	if (!amp.se || !amp.gcc || !amp.gpio) {
++		printf("SWEET AMP: map failed\n");
++		goto out;
++	}
++	for (unsigned p = 93; p <= 96; p++) {
++		uint32_t off = (p - AMP_TLMM_PIN0) * 0x1000u;
++		printf("SWEET AMP: gpio%u cfg=%#x io=%#x\n", p, amp_rd(amp.gpio, off), amp_rd(amp.gpio, off + 4));
++	}
++	if (!amp_clocks()) {
++		goto out;
++	}
++	amp_gpio(93, 3, false, false);
++	amp_gpio(94, 3, false, false);
++	amp_gpio(AMP_IRQ_PIN, 0, false, false);
++	if (!amp_se_init()) {
++		goto out;
++	}
++	/* Reset pulse: low 2 ms, high, then >= 1.5 ms before control-port access. */
++	amp_gpio(AMP_RST_PIN, 0, true, false);
++	ud_sleep_ms(2);
++	amp_gpio(AMP_RST_PIN, 0, true, true);
++	ud_sleep_ms(10);
++	static const struct { uint32_t reg; const char *name; } regs[] = {
++		{ 0x00000000, "DEVID (expect 0x35a40)" },
++		{ 0x00000004, "REVID" },
++		{ 0x00000008, "FABID" },
++		{ 0x00000010, "OTPID" },
++		{ 0x00002014, "PWR_CTRL1" },
++		{ 0x00010010, "IRQ1_STATUS1" },
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		uint32_t v = 0;
++		int err = amp_read(regs[i].reg, &v);
++		printf("SWEET AMP: reg %#010x %s = %#x err %d\n", regs[i].reg, regs[i].name, v, err);
++		if (err == ENXIO && i == 0) {
++			printf("SWEET AMP: no ACK at 0x%x\n", AMP_ADDR);
++			break;
++		}
++	}
++	printf("SWEET AMP: irq gpio96 level %u\n",
++	    (amp_rd(amp.gpio, (AMP_IRQ_PIN - AMP_TLMM_PIN0) * 0x1000u + 4) & 1u));
++out:
++	printf("SWEET AMP: done\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -2322,6 +2727,11 @@ sweet_cpufreq_start(void)
+ 	if (adsp && kernel_thread_start(sweet_adsp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	int ampon = 0;
++	PE_parse_boot_argn("sweetamp", &ampon, sizeof(ampon));
++	if (ampon && kernel_thread_start(sweet_amp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
+ 	if (on && kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
