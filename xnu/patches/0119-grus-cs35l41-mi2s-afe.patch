@@ -1,0 +1,579 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 13f7269..7f651a8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -66,6 +66,8 @@ static void sweet_cpufreq_start(void);
+ static void sweet_smem_probe(void);
+ static void sweet_adsp_thread(void *arg, wait_result_t wr);
+ static void sweet_glink_adsp(void);
++static void sweet_amp_pins(void);
++static void sweet_amp_power(int on);
+ static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ static void sweet_gpu_late_thread(void *arg, wait_result_t wr);
+ static struct { vm_offset_t gcc, cc, gmu; } sweet_gpu_late;
+@@ -1822,39 +1824,81 @@ sweet_glink_adsp(void)
+ 	sweet_glink_send(0, 1, 1u << 0);       /* VERSION v1, INTENT_REUSE */
+ 
+ 	/*
+-	 * Step 3 (0117): APR on "apr_audio_svc" (Linux qcom_glink_native open /
+-	 * intent / tx_data / rx_done, drivers/soc/qcom/apr.c, q6core): answer
+-	 * the ADSP's OPEN with OPEN_ACK and our own OPEN (lcid 1), advertise two
+-	 * 4 KiB RX intents once our OPEN is acked, then on a remote intent send
+-	 * AVCS_CMD_ADSP_EVENT_GET_STATE (0x1290c) and AVCS_GET_VERSIONS
+-	 * (0x12905) to the core service (svc 3, domain apps 5 -> adsp 4) and
+-	 * log the answers; RX_DONE_W_REUSE returns our intents.
++	 * 0119: a small APR script instead of two fixed commands. Remote
++	 * intents go into a pool (INTENT adds, RX_DONE drops, RX_DONE_W_REUSE
++	 * frees). Each step is sent when the previous one has answered (or
++	 * timed out after 3 s): core state/versions, then the AFE (svc 4,
++	 * Linux q6afe.c) brings up Primary MI2S RX (port 0x1000): LPASS clock
++	 * PRI_MI2S_IBIT 1.536 MHz (AFE_SVC_CMD_SET_PARAM / CLOCK_SET),
++	 * I2S config (16 bit, SD0, stereo, WS internal, 48 kHz) and
++	 * DEVICE_START; the muted CS35L41 is powered while the port runs, then
++	 * everything is stopped again. Replies carry a 32-byte APR header.
+ 	 */
++	enum { A_NONE, A_PINS, A_AMP_ON, A_AMP_OFF };
++	static const struct {
++		uint8_t svc, before, after, n;
++		uint32_t opcode;
++		uint32_t p[12];
++		const char *what;
++	} steps[] = {
++		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE" },
++		{ 3, A_NONE, A_NONE, 0, 0x00012905, { 0 }, "core GET_VERSIONS" },
++		{ 4, A_PINS, A_NONE, 12, 0x000100f3,
++		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 1536000, 1, 1 }, "AFE clock PRI_MI2S_IBIT on" },
++		{ 4, A_NONE, A_NONE, 12, 0x000100ef,
++		  { 0x1000u | (32u << 16), 0, 0, 0, 0x0001020c, 0x0001020d, 20, 1,
++		    16u | (1u << 16), 1u | (1u << 16), 48000, 0 }, "AFE PRI_MI2S_RX I2S config" },
++		{ 4, A_NONE, A_AMP_ON, 1, 0x000100e5, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_START" },
++		{ 4, A_AMP_OFF, A_NONE, 1, 0x000100e6, { 0x1000 }, "AFE PRI_MI2S_RX DEVICE_STOP" },
++		{ 4, A_NONE, A_NONE, 12, 0x000100f3,
++		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 0, 1, 0 }, "AFE clock PRI_MI2S_IBIT off" },
++	};
++	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]), stop_step = 5;
+ 	const uint32_t lcid = 1;
+-	uint32_t apr_rcid = 0, riid = 0, rsize = 0, step = 0;
+-	int acked = 0, ravail = 0;
+-	int opens = 0, msgs = 0;
+-	for (int t = 0; t < 1500 && msgs < 400; t++) {   /* ~15 s */
+-		if (acked && ravail && step < 2) {
+-			static const uint32_t ops[2] = { 0x0001290cu, 0x00012905u };
+-			uint32_t w[10];
+-			w[0] = 9u | (lcid << 16);      /* TX_DATA, lcid */
+-			w[1] = riid;
+-			w[2] = 20;                     /* chunk */
+-			w[3] = 0;                      /* left */
+-			w[4] = 0x150u | (20u << 16);   /* APR hdr_field (SEQ_CMD, 5 words), pkt_size */
+-			w[5] = 3u | (5u << 8);         /* src svc core, domain apps, port 0 */
+-			w[6] = 3u | (4u << 8);         /* dest svc core, domain adsp, port 0 */
+-			w[7] = 0x5eed0000u | step;     /* token */
+-			w[8] = ops[step];
+-			w[9] = 0;                      /* pad to 8 */
+-			if (rsize >= 20) {
+-				sweet_glink_tx(w, 10);
+-				printf("SWEET APR: tx opcode 0x%x on riid %u\n", ops[step], riid);
+-				ravail = 0;
+-				step++;
++	uint32_t apr_rcid = 0;
++	struct { uint32_t iid, size; int busy; } pool[8];
++	unsigned npool = 0, step = 0;
++	int acked = 0, opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0;
++	for (int t = 0; t < 4000 && msgs < 600 && step < nsteps; t++) {   /* ~40 s */
++		if (acked && !waiting) {
++			uint32_t bytes = 20 + 4u * steps[step].n;
++			unsigned k;
++			for (k = 0; k < npool && (pool[k].busy || pool[k].size < bytes); k++) {
++			}
++			if (k < npool) {
++				if (steps[step].before == A_PINS) {
++					sweet_amp_pins();
++				} else if (steps[step].before == A_AMP_OFF && start_ok) {
++					sweet_amp_power(0);
++				}
++				uint32_t w[24] = { 0 };
++				uint32_t svc = steps[step].svc;
++				w[0] = 9u | (lcid << 16);
++				w[1] = pool[k].iid;
++				w[2] = bytes;
++				w[3] = 0;
++				w[4] = 0x150u | (bytes << 16);
++				w[5] = svc | (5u << 8);
++				w[6] = svc | (4u << 8);
++				w[7] = 0x5eed0000u | step;
++				w[8] = steps[step].opcode;
++				for (uint32_t j = 0; j < steps[step].n; j++) {
++					w[9 + j] = steps[step].p[j];
++				}
++				pool[k].busy = 1;
++				sweet_glink_tx(w, (9 + steps[step].n + 1u) & ~1u);
++				printf("SWEET APR: step %u %s: tx opcode 0x%x (%u bytes, riid %u)\n",
++				    step, steps[step].what, steps[step].opcode, bytes, pool[k].iid);
++				waiting = 1;
++				wait_t = t;
+ 			}
+ 		}
++		if (waiting && t - wait_t > 300) {
++			printf("SWEET APR: step %u %s: no answer\n", step, steps[step].what);
++			waiting = 0;
++			step = (step >= 2 && step < stop_step) ? stop_step : step + 1;
++			continue;
++		}
+ 		uint32_t head = GL_DESC(3), tail = GL_DESC(2);
+ 		if (head == tail) {
+ 			ud_sleep_ms(10);
+@@ -1886,9 +1930,9 @@ sweet_glink_adsp(void)
+ 			adv = (8 + p2 + 7u) & ~7u;
+ 			if (strcmp(name, "apr_audio_svc") == 0) {
+ 				apr_rcid = p1;
+-				uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };   /* OPEN_ACK rcid */
++				uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };
+ 				sweet_glink_tx(ack, 2);
+-				uint32_t op[6] = { 2u | (lcid << 16), 14, 0, 0, 0, 0 }; /* OPEN lcid, len 14 */
++				uint32_t op[6] = { 2u | (lcid << 16), 14, 0, 0, 0, 0 };
+ 				bcopy("apr_audio_svc", &op[2], 14);
+ 				sweet_glink_tx(op, 6);
+ 				printf("SWEET GLINK: apr_audio_svc: OPEN_ACK %u + OPEN lcid %u sent\n", p1, lcid);
+@@ -1907,22 +1951,29 @@ sweet_glink_adsp(void)
+ 			break;
+ 		case 6:
+ 		case 14:                           /* RX_DONE(_W_REUSE) of a remote intent */
+-			if (p1 == lcid || p1 == apr_rcid) {
+-				if (cmd == 14 && p2 == riid) {
+-					ravail = 1;
++			for (unsigned k = 0; k < npool; k++) {
++				if (pool[k].iid == p2 && pool[k].busy) {
++					if (cmd == 14) {
++						pool[k].busy = 0;
++					} else {
++						pool[k] = pool[--npool];
++					}
++					break;
+ 				}
+ 			}
+-			printf("SWEET GLINK: rx RX_DONE%s cid %u iid %u\n", cmd == 14 ? "_W_REUSE" : "", p1, p2);
+ 			break;
+ 		case 5:                            /* INTENT: cid, count, count x {size, iid} */
+ 			adv = (8 + p2 * 8 + 7u) & ~7u;
+-			if (p1 == apr_rcid && apr_rcid != 0 && p2 >= 1) {
+-				rsize = sweet_glink_rx32(tail + 8);
+-				riid = sweet_glink_rx32(tail + 12);
+-				ravail = 1;
++			if (p1 == apr_rcid && apr_rcid != 0) {
++				for (uint32_t k = 0; k < p2 && npool < 8; k++) {
++					pool[npool].size = sweet_glink_rx32(tail + 8 + 8 * k);
++					pool[npool].iid = sweet_glink_rx32(tail + 12 + 8 * k);
++					pool[npool].busy = 0;
++					npool++;
++				}
+ 			}
+-			printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u)\n", p1, p2,
+-			    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12));
++			printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u), pool %u\n", p1, p2,
++			    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12), npool);
+ 			break;
+ 		case 9:
+ 		case 12: {                         /* TX_DATA(_CONT): chunk, left, data */
+@@ -1940,24 +1991,36 @@ sweet_glink_adsp(void)
+ 					plen = chunk;
+ 				}
+ 				uint32_t nw = (plen - hlen) / 4u;
+-				uint32_t last = nw ? sweet_glink_rx32(d + hlen + 4u * (nw - 1u)) : 0;
+-				/*
+-				 * 0118: the k37 log showed 16 payload bytes for GET_STATE
+-				 * (0x4000102 0x6d22542 0 1); dump everything raw instead of
+-				 * guessing a layout, and judge GET_STATE by its last word.
+-				 */
+-				printf("SWEET APR: rx opcode 0x%x token 0x%x hdr 0x%x (hlen %u pkt %u chunk %u)%s\n",
+-				    opc, tok, hf, hlen, plen, chunk,
+-				    opc == 0x0001290du ? (last == 1 ? " ADSP READY" : " adsp not ready") : "");
+-				for (uint32_t k = 0; k < nw && k < 32; k += 8) {
+-					uint32_t v[8] = { 0 };
+-					for (uint32_t j = 0; j < 8 && k + j < nw; j++) {
+-						v[j] = sweet_glink_rx32(d + hlen + 4u * (k + j));
++				uint32_t a0 = nw > 0 ? sweet_glink_rx32(d + hlen) : 0;
++				uint32_t a1 = nw > 1 ? sweet_glink_rx32(d + hlen + 4) : 0;
++				printf("SWEET APR: rx opcode 0x%x token 0x%x (%u payload words): 0x%x 0x%x\n",
++				    opc, tok, nw, a0, a1);
++				if (opc == 0x00012906u) {
++					for (uint32_t k = 0; k < a1 && 8 + 8 * k + 8 <= nw * 4u; k++) {
++						printf("SWEET APR:   service 0x%x version 0x%x\n",
++						    sweet_glink_rx32(d + hlen + 8 + 8 * k), sweet_glink_rx32(d + hlen + 12 + 8 * k));
++					}
++				}
++				if (waiting && tok == (0x5eed0000u | step)) {
++					int ok;
++					if (opc == 0x000110e8u) {           /* APR_BASIC_RSP_RESULT {opcode, status} */
++						ok = (a1 == 0);
++						printf("SWEET APR: step %u %s: %s (status 0x%x)\n", step, steps[step].what,
++						    ok ? "OK" : "FAILED", a1);
++					} else {
++						ok = 1;
++						if (opc == 0x0001290du) {
++							printf("SWEET APR: ADSP %s\n", a0 == 1 ? "READY" : "not ready");
++						}
+ 					}
+-					printf("SWEET APR:   +%02u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-					    k * 4u, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++					waiting = 0;
++					if (ok && steps[step].after == A_AMP_ON) {
++						start_ok = 1;
++						sweet_amp_power(1);
++					}
++					step = (!ok && step >= 2 && step < stop_step) ? stop_step : step + 1;
+ 				}
+-				uint32_t done[2] = { 14u | (lcid << 16), p2 };      /* RX_DONE_W_REUSE liid */
++				uint32_t done[2] = { 14u | (lcid << 16), p2 };
+ 				GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+ 				sweet_glink_tx(done, 2);
+ 				continue;
+@@ -1971,8 +2034,8 @@ sweet_glink_adsp(void)
+ 		}
+ 		GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+ 	}
+-	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; desc tx %u/%u rx %u/%u\n",
+-	    msgs, opens, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
++	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; desc tx %u/%u rx %u/%u\n",
++	    msgs, opens, step, nsteps, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
+ }
+ 
+ /*
+@@ -2208,6 +2271,315 @@ amp_read(uint32_t reg, uint32_t *val)
+ 	return err;
+ }
+ 
++/*
++ * 0119: CS35L41 bring-up, following Linux cs35l41_probe / cs35l41-lib.c:
++ * OTP_BOOT_DONE, B0/B2 errata, OTP trim unpack, boost from the grus DT
++ * (cirrus,boost-ind-nanohenry 1000, -cap-microfarad 15, -peak-milliamp
++ * 4000), ASP as I2S consumer (16-bit slots, 48 kHz, PLL from SCLK
++ * 1.536 MHz), PCM source ASPRX1. The digital volume stays MUTED: this
++ * step only checks that the amp powers up and locks to the MI2S clocks.
++ */
++struct sweet_otp_el {
++	uint32_t reg;
++	uint8_t shift, size;
++};
++static const struct sweet_otp_el sweet_amp_map_1[] = {
++	{ 0x2030, 0, 4 }, { 0x2030, 7, 1 }, { 0x208c, 24, 6 }, { 0x2090, 14, 4 },
++	{ 0x2090, 10, 4 }, { 0x300c, 11, 4 }, { 0x394c, 23, 2 }, { 0x3950, 0, 7 },
++	{ 0x3950, 8, 7 }, { 0x3950, 16, 8 }, { 0x3950, 24, 8 }, { 0x3954, 0, 7 },
++	{ 0x3954, 8, 7 }, { 0x3954, 16, 8 }, { 0x3954, 24, 8 }, { 0x3958, 0, 7 },
++	{ 0x3958, 8, 7 }, { 0x3958, 16, 8 }, { 0x3958, 24, 8 }, { 0x395c, 0, 7 },
++	{ 0x395c, 8, 7 }, { 0x395c, 16, 8 }, { 0x395c, 24, 8 }, { 0x416c, 0, 8 },
++	{ 0x4160, 0, 7 }, { 0x416c, 8, 8 }, { 0x4160, 16, 10 }, { 0x416c, 16, 12 },
++	{ 0x416c, 28, 1 }, { 0x4170, 0, 6 }, { 0x4170, 6, 1 }, { 0x4170, 8, 6 },
++	{ 0x4170, 14, 1 }, { 0x4170, 16, 9 }, { 0x4360, 0, 5 }, { 0x4360, 6, 9 },
++	{ 0x4448, 0, 8 }, { 0x4448, 8, 8 }, { 0x4448, 16, 8 }, { 0x4448, 24, 8 },
++	{ 0x444c, 0, 3 }, { 0x6e30, 0, 5 }, { 0x6e30, 8, 5 }, { 0x6e30, 16, 5 },
++	{ 0x6e30, 24, 5 }, { 0x6e34, 0, 5 }, { 0x6e34, 8, 5 }, { 0x6e34, 16, 5 },
++	{ 0x6e34, 24, 5 }, { 0x6e38, 0, 5 }, { 0x6e38, 8, 5 }, { 0x6e38, 16, 5 },
++	{ 0x6e38, 24, 5 }, { 0x6e3c, 0, 5 }, { 0x6e3c, 8, 5 }, { 0x6e3c, 16, 5 },
++	{ 0x6e3c, 24, 5 }, { 0x6e40, 0, 5 }, { 0x6e40, 8, 5 }, { 0x6e40, 16, 5 },
++	{ 0x6e40, 24, 5 }, { 0x6e44, 0, 5 }, { 0x6e48, 0, 10 }, { 0x6e48, 10, 10 },
++	{ 0x6e48, 20, 10 }, { 0x6e4c, 0, 10 }, { 0x6e4c, 10, 10 },
++	{ 0x6e4c, 20, 10 }, { 0x6e50, 0, 10 }, { 0x6e50, 10, 10 },
++	{ 0x6e50, 20, 10 }, { 0x6e54, 0, 10 }, { 0x6e54, 10, 10 },
++	{ 0x6e54, 20, 10 }, { 0x6e58, 0, 10 }, { 0x6e58, 10, 10 },
++	{ 0x6e58, 20, 10 }, { 0x6e5c, 0, 10 }, { 0x6e5c, 10, 10 },
++	{ 0x6e5c, 20, 10 }, { 0x6e60, 0, 10 }, { 0x6e60, 10, 10 },
++	{ 0x6e60, 20, 10 }, { 0x6e64, 0, 10 }, { 0x7418, 7, 5 }, { 0x741c, 0, 5 },
++	{ 0x741c, 11, 4 }, { 0x741c, 19, 4 }, { 0x7434, 17, 1 }, { 0x7434, 18, 7 },
++	{ 0x7068, 0, 9 }, { 0x410c, 7, 1 }, { 0x400c, 0, 7 }, { 0x0, 0, 1 },
++	{ 0x17040, 0, 8 }, { 0x17040, 8, 8 }, { 0x17040, 16, 8 }, { 0x17040, 24, 8 },
++	{ 0x17044, 0, 24 },
++};
++static const struct sweet_otp_el sweet_amp_map_2[] = {
++	{ 0x2030, 0, 4 }, { 0x2030, 7, 1 }, { 0x208c, 24, 6 }, { 0x2090, 14, 4 },
++	{ 0x2090, 10, 4 }, { 0x300c, 11, 4 }, { 0x394c, 23, 2 }, { 0x3950, 0, 7 },
++	{ 0x3950, 8, 7 }, { 0x3950, 16, 8 }, { 0x3950, 24, 8 }, { 0x3954, 0, 7 },
++	{ 0x3954, 8, 7 }, { 0x3954, 16, 8 }, { 0x3954, 24, 8 }, { 0x3958, 0, 7 },
++	{ 0x3958, 8, 7 }, { 0x3958, 16, 8 }, { 0x3958, 24, 8 }, { 0x395c, 0, 7 },
++	{ 0x395c, 8, 7 }, { 0x395c, 16, 8 }, { 0x395c, 24, 8 }, { 0x416c, 0, 8 },
++	{ 0x4160, 0, 7 }, { 0x416c, 8, 8 }, { 0x4160, 16, 10 }, { 0x416c, 16, 12 },
++	{ 0x416c, 28, 1 }, { 0x4170, 0, 6 }, { 0x4170, 6, 1 }, { 0x4170, 8, 6 },
++	{ 0x4170, 14, 1 }, { 0x4170, 16, 9 }, { 0x4360, 0, 5 }, { 0x4360, 6, 9 },
++	{ 0x4448, 0, 8 }, { 0x4448, 8, 8 }, { 0x4448, 16, 8 }, { 0x4448, 24, 8 },
++	{ 0x444c, 0, 3 }, { 0x6e30, 0, 5 }, { 0x6e30, 8, 5 }, { 0x6e30, 16, 5 },
++	{ 0x6e30, 24, 5 }, { 0x6e34, 0, 5 }, { 0x6e34, 8, 5 }, { 0x6e34, 16, 5 },
++	{ 0x6e34, 24, 5 }, { 0x6e38, 0, 5 }, { 0x6e38, 8, 5 }, { 0x6e38, 16, 5 },
++	{ 0x6e38, 24, 5 }, { 0x6e3c, 0, 5 }, { 0x6e3c, 8, 5 }, { 0x6e3c, 16, 5 },
++	{ 0x6e3c, 24, 5 }, { 0x6e40, 0, 5 }, { 0x6e40, 8, 5 }, { 0x6e40, 16, 5 },
++	{ 0x6e40, 24, 5 }, { 0x6e44, 0, 5 }, { 0x6e48, 0, 10 }, { 0x6e48, 10, 10 },
++	{ 0x6e48, 20, 10 }, { 0x6e4c, 0, 10 }, { 0x6e4c, 10, 10 },
++	{ 0x6e4c, 20, 10 }, { 0x6e50, 0, 10 }, { 0x6e50, 10, 10 },
++	{ 0x6e50, 20, 10 }, { 0x6e54, 0, 10 }, { 0x6e54, 10, 10 },
++	{ 0x6e54, 20, 10 }, { 0x6e58, 0, 10 }, { 0x6e58, 10, 10 },
++	{ 0x6e58, 20, 10 }, { 0x6e5c, 0, 10 }, { 0x6e5c, 10, 10 },
++	{ 0x6e5c, 20, 10 }, { 0x6e60, 0, 10 }, { 0x6e60, 10, 10 },
++	{ 0x6e60, 20, 10 }, { 0x6e64, 0, 10 }, { 0x7418, 7, 5 }, { 0x741c, 0, 5 },
++	{ 0x741c, 11, 4 }, { 0x741c, 19, 4 }, { 0x7434, 17, 1 }, { 0x7434, 18, 7 },
++	{ 0x7068, 0, 9 }, { 0x410c, 7, 1 }, { 0x400c, 0, 7 }, { 0x4000, 11, 1 },
++	{ 0x17040, 0, 8 }, { 0x17040, 8, 8 }, { 0x17040, 16, 8 }, { 0x17040, 24, 8 },
++	{ 0x17044, 0, 24 },
++};
++
++static bool amp_ready;
++
++static int
++amp_write(uint32_t reg, uint32_t val)
++{
++	uint8_t b[8] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
++		         (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
++	int err = amp_msg(b, 8, NULL, 0, false);
++	if (err) {
++		printf("SWEET AMP: write %#x = %#x failed %d\n", reg, val, err);
++	}
++	return err;
++}
++
++static int
++amp_update(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t v = 0;
++	int err = amp_read(reg, &v);
++	if (err) {
++		printf("SWEET AMP: read %#x failed %d\n", reg, err);
++		return err;
++	}
++	return amp_write(reg, (v & ~mask) | (val & mask));
++}
++
++static uint32_t
++amp_genmask(int h, int l)
++{
++	if (h < l || h > 31 || l < 0) {
++		return 0;
++	}
++	return (0xffffffffu >> (31 - h)) & (0xffffffffu << l);
++}
++
++static int
++amp_otp_unpack(void)
++{
++	uint32_t id = 0, mem[32];
++	if (amp_read(0x10, &id)) {
++		return EIO;
++	}
++	const struct sweet_otp_el *map;
++	unsigned n;
++	switch (id) {
++	case 0x01: case 0x08:
++		map = sweet_amp_map_1; n = sizeof(sweet_amp_map_1) / sizeof(map[0]); break;
++	case 0x02: case 0x03: case 0x06:
++		map = sweet_amp_map_2; n = sizeof(sweet_amp_map_2) / sizeof(map[0]); break;
++	default:
++		printf("SWEET AMP: unknown OTPID %#x\n", id);
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < 32; i++) {
++		if (amp_read(0x400 + 4 * i, &mem[i])) {
++			return EIO;
++		}
++	}
++	int bit = 16, word = 2, writes = 0;
++	for (unsigned i = 0; i < n; i++) {
++		uint32_t v = 0;
++		int size = map[i].size;
++		if (bit + size - 1 >= 32) {
++			v = (mem[word] & amp_genmask(31, bit)) >> bit;
++			word++;
++			v |= (word < 32 ? (mem[word] & amp_genmask(bit + size - 33, 0)) : 0) << (32 - bit);
++			bit += size - 32;
++		} else if (bit + size - 1 >= 0 && size > 0) {
++			v = (mem[word] & amp_genmask(bit + size - 1, bit)) >> bit;
++			bit += size;
++		}
++		if (bit == 32) {
++			bit = 0;
++			word++;
++		}
++		if (word >= 32) {
++			printf("SWEET AMP: OTP map overrun at %u\n", i);
++			return EIO;
++		}
++		if (map[i].reg != 0 && size > 0) {
++			if (amp_update(map[i].reg, amp_genmask(map[i].shift + size - 1, map[i].shift),
++			    v << map[i].shift)) {
++				return EIO;
++			}
++			writes++;
++		}
++	}
++	printf("SWEET AMP: OTP id %#x unpacked, %d trims written\n", id, writes);
++	return 0;
++}
++
++static int
++amp_setup(uint32_t revid)
++{
++	uint32_t v = 0;
++	unsigned i;
++	for (i = 0; i < 100; i++) {
++		if (amp_read(0x1001c, &v) == 0 && (v & 2u)) {
++			break;
++		}
++		ud_sleep_ms(1);
++	}
++	uint32_t s3 = 0;
++	(void)amp_read(0x10018, &s3);
++	printf("SWEET AMP: OTP_BOOT_DONE %s (status4 %#x status3 %#x)\n", (v & 2u) ? "yes" : "NO", v, s3);
++	if (!(v & 2u) || (s3 & 0x80000000u)) {
++		return EIO;
++	}
++	if (revid != 0xb0 && revid != 0xb2) {
++		printf("SWEET AMP: revision %#x has no errata table here\n", revid);
++		return ENOTSUP;
++	}
++	static const uint32_t errata[][2] = {
++		{ 0x4100, 0 }, { 0x4310, 0 }, { 0x4400, 0 }, { 0x381c, 0x51 },
++		{ 0x02bc20e0, 0 }, { 0x02bc2020, 0 }, { 0x2018, 0 }, { 0x6c04, 0 },
++		{ 0x4c28, 0 }, { 0x4c2c, 0 },
++	};
++	int err = amp_write(0x40, 0x55) | amp_write(0x40, 0xaa);
++	for (i = 0; !err && i < sizeof(errata) / sizeof(errata[0]); i++) {
++		err = amp_write(errata[i][0], errata[i][1]);
++	}
++	if (!err) {
++		err = amp_write(0x02bc1000, 0);      /* DSP1_CCM_CORE_CTRL */
++	}
++	if (!err) {
++		err = amp_otp_unpack();
++	}
++	err |= amp_write(0x40, 0xcc) | amp_write(0x40, 0x33);
++	if (err) {
++		return EIO;
++	}
++	err |= amp_write(0x10110, 0x7ffcfe3f);       /* IRQ1_MASK1 default */
++	/* Boost: L 1.0 uH -> lbst 0, C 15 uF -> range 0, Ipk 4000 mA -> 0x40. */
++	err |= amp_update(0x3810, 0xffff, 0x24 | (0x24u << 8));
++	err |= amp_update(0x3814, 0xff03, 0x75u << 8);
++	err |= amp_update(0x3808, 0x7f, ((4000 - 1600) / 50) + 0x10);
++	err |= amp_update(0x2018, 0x30, 2u << 4);    /* BST_EN default */
++	/* ASP: I2S, SCLK/LRCLK from the SoC, 16-bit RX slots and words, 48 kHz. */
++	err |= amp_update(0x4808, 0x0711, 2u << 8);
++	err |= amp_update(0x4808, 0xff000000u, 16u << 24);
++	err |= amp_update(0x4840, 0x3f, 16);
++	err |= amp_update(0x2c0c, 0x1f, 0x03);
++	/* PLL reference = SCLK 1.536 MHz (cfg 0x1b), as cs35l41_component_set_sysclk. */
++	err |= amp_update(0x2c04, 0x0800, 0x0800);
++	err |= amp_update(0x2c04, 0x07e0, 0x1bu << 5);
++	err |= amp_update(0x2c04, 0x0010, 0);
++	err |= amp_update(0x2c04, 0x0007, 0);
++	err |= amp_update(0x2c04, 0x0800, 0);
++	err |= amp_update(0x2c04, 0x0010, 0x0010);
++	err |= amp_write(0x2d10, 52 | ((84u << 12) & 0x00fff800u));   /* TST_FS_MON0 */
++	err |= amp_write(0x4c00, 0x08);              /* DAC_PCM1_SRC = ASPRX1 */
++	err |= amp_update(0x6000, 0x3ff8, 0x400u << 3);              /* digital volume: MUTE */
++	err |= amp_update(0x4800, 1u << 16, 1u << 16);               /* ASPRX1 enable */
++	if (err) {
++		printf("SWEET AMP: setup register write failed\n");
++		return EIO;
++	}
++	static const uint32_t show[] = { 0x2018, 0x2c04, 0x2c0c, 0x3808, 0x3810, 0x3814, 0x4800, 0x4808, 0x4840, 0x4c00, 0x6000 };
++	for (i = 0; i < sizeof(show) / sizeof(show[0]); i++) {
++		(void)amp_read(show[i], &v);
++		printf("SWEET AMP:   %#06x = %#010x\n", show[i], v);
++	}
++	return 0;
++}
++
++static void
++amp_status(const char *when)
++{
++	static const uint32_t regs[] = { 0x10010, 0x10014, 0x10018, 0x1001c, 0x10090, 0x10094, 0x10098, 0x1009c, 0x2014, 0x2018, 0x2908 };
++	uint32_t v[11] = { 0 };
++	for (unsigned i = 0; i < 11; i++) {
++		(void)amp_read(regs[i], &v[i]);
++	}
++	printf("SWEET AMP: %s: irq1 %08x %08x %08x %08x raw %08x %08x %08x %08x pwr %x/%x pwrmgt %x%s%s\n",
++	    when, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10],
++	    (v[6] & 2u) ? " PLL-LOCK" : "", (v[0] & 0x80000000u) ? " AMP-SHORT" : "");
++}
++
++/* MI2S pins (grus pri_mi2s*_active): gpio65 SCK, 66 WS, 67 SD0, 68 SD1, function 1. */
++static void
++sweet_amp_pins(void)
++{
++	vm_offset_t n = ml_io_map(0x03940000u, 0x8000);   /* TLMM NORTH, pins 64-71 */
++	if (!n) {
++		return;
++	}
++	for (unsigned p = 65; p <= 68; p++) {
++		uint32_t off = (p - 64) * 0x1000u;
++		uint32_t cfg = amp_rd(n, off);
++		amp_wr(n, off, (cfg & ~0x3ffu) | (1u << 2));
++		printf("SWEET AMP: gpio%u cfg %#x -> %#x\n", p, cfg, amp_rd(n, off));
++	}
++}
++
++static void
++sweet_amp_power(int on)
++{
++	if (!amp_ready) {
++		printf("SWEET AMP: not configured, power %d skipped\n", on);
++		return;
++	}
++	uint32_t v = 0;
++	if (on) {
++		amp_status("before power-up");
++		amp_write(0x40, 0x55); amp_write(0x40, 0xaa);
++		amp_write(0x2084, 0x002f1aa0);
++		amp_write(0x40, 0xcc); amp_write(0x40, 0x33);
++		amp_update(0x2014, 1, 1);                     /* GLOBAL_EN */
++		for (unsigned i = 0; i < 100; i++) {
++			if (amp_read(0x10010, &v) == 0 && (v & 0x01000000u)) {
++				break;
++			}
++			ud_sleep_ms(1);
++		}
++		printf("SWEET AMP: PUP_DONE %s\n", (v & 0x01000000u) ? "yes" : "NO");
++		amp_write(0x10010, 0x01000000u);
++		amp_update(0x2018, 1, 1);                     /* AMP_EN */
++		ud_sleep_ms(100);
++		amp_status("on +100ms");
++		ud_sleep_ms(2000);
++		amp_status("on +2s");
++	} else {
++		amp_update(0x2018, 1, 0);
++		amp_update(0x2014, 1, 0);
++		for (unsigned i = 0; i < 100; i++) {
++			if (amp_read(0x10010, &v) == 0 && (v & 0x00800000u)) {
++				break;
++			}
++			ud_sleep_ms(1);
++		}
++		amp_write(0x10010, 0x00800000u);
++		amp_write(0x40, 0x55); amp_write(0x40, 0xaa);
++		amp_write(0x2084, 0x002f1aa3);
++		amp_write(0x40, 0xcc); amp_write(0x40, 0x33);
++		amp_status("powered down");
++	}
++}
++
+ static void
+ sweet_amp_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -2246,15 +2618,22 @@ sweet_amp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		{ 0x00002014, "PWR_CTRL1" },
+ 		{ 0x00010010, "IRQ1_STATUS1" },
+ 	};
++	uint32_t got[6] = { 0 };
+ 	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+ 		uint32_t v = 0;
+ 		int err = amp_read(regs[i].reg, &v);
++		got[i] = err ? 0xffffffffu : v;
+ 		printf("SWEET AMP: reg %#010x %s = %#x err %d\n", regs[i].reg, regs[i].name, v, err);
+ 		if (err == ENXIO && i == 0) {
+ 			printf("SWEET AMP: no ACK at 0x%x\n", AMP_ADDR);
+ 			break;
+ 		}
+ 	}
++	if (got[0] == 0x35a40) {
++		int serr = amp_setup(got[1]);
++		amp_ready = (serr == 0);
++		printf("SWEET AMP: setup %s (%d)\n", amp_ready ? "done, muted, waiting for MI2S clocks" : "FAILED", serr);
++	}
+ 	printf("SWEET AMP: irq gpio96 level %u\n",
+ 	    (amp_rd(amp.gpio, (AMP_IRQ_PIN - AMP_TLMM_PIN0) * 0x1000u + 4) & 1u));
+ out:
