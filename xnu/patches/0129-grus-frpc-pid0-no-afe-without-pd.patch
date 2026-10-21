@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f11ad7f..d6726b3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2439,7 +2439,9 @@ sweet_glink_adsp(void)
+ 	struct sweet_qrtr_st qs;
+ 	bzero(&qs, sizeof(qs));
+ 	qs.adsp_node = 5;
+-	for (int t = 0; t < 6000 && msgs < 2000 && step < nsteps; t++) {   /* ~60 s */
++	int frpc_ret = -1;
++	vm_offset_t asm_g = ml_io_map(0x15000000, 0x80000);
++	for (int t = 0; t < 12000 && msgs < 4000 && step < nsteps; t++) {   /* ~120 s */
+ 		if (qs.served && qs.notif_port && !qs.registered && ch[1].acked) {
+ 			sweet_pdr_register(&ch[1], &qs);
+ 		}
+@@ -2464,7 +2466,7 @@ sweet_glink_adsp(void)
+ 			} else {
+ 				uint32_t msg[10];
+ 				uint64_t meta = sweet_frpc_create_static_args(0x5eed);
+-				msg[0] = 0x5eed;                       /* pid (adsprpcd tgid) */
++				msg[0] = 0;                            /* 0129: kernel invoke -> pid 0 (adsprpc.c) */
+ 				msg[1] = 0x5eee;                       /* tid */
+ 				msg[2] = 0x5eed0000u | (1u << 4) | 1u; /* ctx: id | static pd */
+ 				msg[3] = 0;
+@@ -2488,13 +2490,23 @@ sweet_glink_adsp(void)
+ 			}
+ 		}
+ 		if (frpc == 1 && (t - frpc_t) % 100 == 50) {
+-			printf("SWEET FRPC: waiting for the reply, %d s\n", (t - frpc_t) / 100);
++			uint32_t gfsr = asm_g ? smmu_rd(asm_g, 0x48) : 0, gsyn = asm_g ? smmu_rd(asm_g, 0x50) : 0;
++			uint32_t cbfsr = asm_g ? smmu_rd(asm_g, (64u + 8u) * 0x1000u + 0x58) : 0;
++			printf("SWEET FRPC: waiting for the reply, %d s; apps SMMU sGFSR 0x%x sGFSYNR0 0x%x CB8 FSR 0x%x\n",
++			    (t - frpc_t) / 100, gfsr, gsyn, cbfsr);
+ 		}
+-		if (frpc == 1 && t - frpc_t > 500) {
+-			printf("SWEET FRPC: no answer to CREATE_STATIC in 5 s\n");
++		if (frpc == 1 && t - frpc_t > 3000) {
++			printf("SWEET FRPC: no answer to CREATE_STATIC in 30 s\n");
+ 			frpc = 3;
+ 		}
+-		int afe_go = step < 1 || ((frpc >= 2) && t - frpc_t > 100) || t > 3500;
++		/* 0129: k48 hung the whole SoC right after the AFE clock command that
++		 * followed an unanswered CREATE_STATIC; AFE steps now run only after a
++		 * successful CREATE_STATIC reply, otherwise the script stops. */
++		if (frpc == 3 || (frpc == 2 && frpc_ret != 0)) {
++			printf("SWEET APR: audio PD not created (frpc %d ret %d): AFE steps skipped\n", frpc, frpc_ret);
++			break;
++		}
++		int afe_go = step < 1 || (frpc == 2 && frpc_ret == 0 && t - frpc_t > 100);
+ 		unsigned sc = steps[step].chn == 9 ? afe_ch : steps[step].chn;
+ 		if (!waiting && afe_go && steps[step].chn == 2 && !ch[2].acked && t > 3500) {
+ 			printf("SWEET APR: step %u %s: apr_apps2 not open, skipped\n", step, steps[step].what);
+@@ -2637,6 +2649,7 @@ sweet_glink_adsp(void)
+ 				    (frpc == 1 && r0 == (0x5eed0000u | 0x11u)) ? (r2 == 0 ? " -> audiopd CREATED" : " -> CREATE_STATIC failed") : "");
+ 				if (frpc == 1 && r0 == (0x5eed0000u | 0x11u)) {
+ 					frpc = 2;
++					frpc_ret = (int)r2;
+ 					frpc_t = t;
+ 				}
+ 			} else if (c == &ch[1]) {
