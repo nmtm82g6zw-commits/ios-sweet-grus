@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 7f651a8..a52f352 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1796,6 +1796,34 @@ sweet_glink_rx32(uint32_t off)
+ 	return usb_rd(sweet_gl.rx, off % sweet_gl.rxlen);
+ }
+ 
++/* qcom_q6v5_pas adsp: crash_reason_smem 423 (global heap item). */
++static void
++sweet_adsp_crash_reason(void)
++{
++	const uint32_t size = 0x200000;
++	vm_offset_t m = ml_io_map_unmappable(0x86000000, size, VM_WIMG_IO);
++	if (m == 0) {
++		return;
++	}
++	vm_offset_t toc = m + 64 + 128 + 12 + 423 * 16;
++	uint32_t alloc = usb_rd(toc, 0), off = usb_rd(toc, 4), sz = usb_rd(toc, 8);
++	char str[120];
++	uint32_t k = 0;
++	if (alloc == 1 && off + sz <= size) {
++		for (; k < sizeof(str) - 1 && k < sz; k++) {
++			uint32_t w = usb_rd(m + off, k & ~3u);
++			char c = (char)(w >> (8 * (k & 3u)));
++			if (c == 0) {
++				break;
++			}
++			str[k] = (c >= 32 && c < 127) ? c : '.';
++		}
++	}
++	str[k] = 0;
++	printf("SWEET ADSP: crash reason (smem 423 alloc %u size %u): \"%s\"\n", alloc, sz, str);
++	sweet_io_unmap(m, size);
++}
++
+ static void
+ sweet_glink_adsp(void)
+ {
+@@ -1842,9 +1870,11 @@ sweet_glink_adsp(void)
+ 		const char *what;
+ 	} steps[] = {
+ 		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE" },
+-		{ 3, A_NONE, A_NONE, 0, 0x00012905, { 0 }, "core GET_VERSIONS" },
++		{ 4, A_NONE, A_NONE, 1, 0x000100e6, { 0x1000 }, "AFE probe: DEVICE_STOP (idle port)" },
++		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE (alive after AFE probe?)" },
+ 		{ 4, A_PINS, A_NONE, 12, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 1536000, 1, 1 }, "AFE clock PRI_MI2S_IBIT on" },
++		{ 3, A_NONE, A_NONE, 0, 0x0001290c, { 0 }, "core GET_STATE (alive after clock?)" },
+ 		{ 4, A_NONE, A_NONE, 12, 0x000100ef,
+ 		  { 0x1000u | (32u << 16), 0, 0, 0, 0x0001020c, 0x0001020d, 20, 1,
+ 		    16u | (1u << 16), 1u | (1u << 16), 48000, 0 }, "AFE PRI_MI2S_RX I2S config" },
+@@ -1853,7 +1883,7 @@ sweet_glink_adsp(void)
+ 		{ 4, A_NONE, A_NONE, 12, 0x000100f3,
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 0, 1, 0 }, "AFE clock PRI_MI2S_IBIT off" },
+ 	};
+-	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]), stop_step = 5;
++	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]);
+ 	const uint32_t lcid = 1;
+ 	uint32_t apr_rcid = 0;
+ 	struct { uint32_t iid, size; int busy; } pool[8];
+@@ -1896,7 +1926,7 @@ sweet_glink_adsp(void)
+ 		if (waiting && t - wait_t > 300) {
+ 			printf("SWEET APR: step %u %s: no answer\n", step, steps[step].what);
+ 			waiting = 0;
+-			step = (step >= 2 && step < stop_step) ? stop_step : step + 1;
++			step++;
+ 			continue;
+ 		}
+ 		uint32_t head = GL_DESC(3), tail = GL_DESC(2);
+@@ -1951,6 +1981,9 @@ sweet_glink_adsp(void)
+ 			break;
+ 		case 6:
+ 		case 14:                           /* RX_DONE(_W_REUSE) of a remote intent */
++			if (waiting) {
++				printf("SWEET GLINK: rx RX_DONE%s cid %u iid %u\n", cmd == 14 ? "_W_REUSE" : "", p1, p2);
++			}
+ 			for (unsigned k = 0; k < npool; k++) {
+ 				if (pool[k].iid == p2 && pool[k].busy) {
+ 					if (cmd == 14) {
+@@ -1972,8 +2005,10 @@ sweet_glink_adsp(void)
+ 					npool++;
+ 				}
+ 			}
+-			printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u), pool %u\n", p1, p2,
+-			    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12), npool);
++			if (npool < 8) {
++				printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u), pool %u\n", p1, p2,
++				    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12), npool);
++			}
+ 			break;
+ 		case 9:
+ 		case 12: {                         /* TX_DATA(_CONT): chunk, left, data */
+@@ -2018,7 +2053,7 @@ sweet_glink_adsp(void)
+ 						start_ok = 1;
+ 						sweet_amp_power(1);
+ 					}
+-					step = (!ok && step >= 2 && step < stop_step) ? stop_step : step + 1;
++					step++;
+ 				}
+ 				uint32_t done[2] = { 14u | (lcid << 16), p2 };
+ 				GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+@@ -2036,6 +2071,7 @@ sweet_glink_adsp(void)
+ 	}
+ 	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; desc tx %u/%u rx %u/%u\n",
+ 	    msgs, opens, step, nsteps, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
++	sweet_adsp_crash_reason();
+ }
+ 
+ /*
