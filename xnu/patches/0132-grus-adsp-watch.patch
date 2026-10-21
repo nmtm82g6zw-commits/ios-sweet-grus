@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f5d7009..a71cab8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2390,6 +2390,55 @@ sweet_adsp_crash_reason(void)
+ 	sweet_io_unmap(m, size);
+ }
+ 
++/*
++ * 0132: k49 and k51 both died ~14 s after CREATE_STATIC without a panic.
++ * Watch the ADSP from the apps side meanwhile: its SMP2P outbound entries
++ * (Linux qcom,smp2p-adsp: item 443 in the apps<->adsp partition,
++ * "slave-kernel" bit 0 fatal, 1 ready, 2 handover, 3 stop-ack) and the
++ * crash reason (SMEM 423).
++ */
++static void
++sweet_adsp_watch(vm_offset_t part, uint32_t psize, const char *when)
++{
++	struct sweet_smem_item it = { 0, 0 };
++	char line[160];
++	int n = 0;
++	if (sweet_smem_find(part, psize, 443, &it) == 0 && it.size >= 24 && usb_rd(it.data, 0) == 0x504d5324u) {
++		uint32_t valid = usb_rd(it.data, 16) & 0xffffu;
++		n = snprintf(line, sizeof(line), "smp2p v%u valid %u:", usb_rd(it.data, 8) & 0xffu, valid);
++		for (uint32_t e = 0; e < valid && e < 4 && 24 + 20 * (e + 1) <= it.size; e++) {
++			char nm[17];
++			for (int k = 0; k < 16; k++) {
++				uint32_t w = usb_rd(it.data + 24 + 20 * e, k & ~3);
++				char c = (char)(w >> (8 * (k & 3)));
++				nm[k] = (c >= 32 && c < 127) ? c : 0;
++			}
++			nm[16] = 0;
++			n += snprintf(line + n, sizeof(line) - n, " %s=0x%x", nm, usb_rd(it.data + 24 + 20 * e, 16));
++		}
++	} else {
++		snprintf(line, sizeof(line), "smp2p item 443 not found");
++	}
++	vm_offset_t g = ml_io_map_unmappable(0x86000000, 0x200000, VM_WIMG_IO);
++	char cr[64] = { 0 };
++	if (g) {
++		vm_offset_t toc = g + 64 + 128 + 12 + 423 * 16;
++		uint32_t alloc = usb_rd(toc, 0), off = usb_rd(toc, 4), sz = usb_rd(toc, 8);
++		if (alloc == 1 && off + sz <= 0x200000) {
++			for (uint32_t k = 0; k < sizeof(cr) - 1 && k < sz; k++) {
++				uint32_t w = usb_rd(g + off, k & ~3u);
++				char c = (char)(w >> (8 * (k & 3u)));
++				if (!c) {
++					break;
++				}
++				cr[k] = (c >= 32 && c < 127) ? c : '.';
++			}
++		}
++		sweet_io_unmap(g, 0x200000);
++	}
++	printf("SWEET ADSP: %s: %s; crash reason \"%s\"\n", when, line, cr);
++}
++
+ static void
+ sweet_glink_adsp(void)
+ {
+@@ -2511,7 +2560,8 @@ sweet_glink_adsp(void)
+ 				msg[8] = 0x1000;                       /* buf_page_size(784) */
+ 				msg[9] = 0;
+ 				if (sweet_glch_send(&ch[3], msg, 40) == 0) {
+-					printf("SWEET FRPC: CREATE_STATIC \"audiopd\" sent (args at 0x%llx, heap 0x%llx+0x%x)\n",
++					sweet_adsp_watch(m, psize, "at CREATE_STATIC");
++				printf("SWEET FRPC: CREATE_STATIC \"audiopd\" sent (args at 0x%llx, heap 0x%llx+0x%x)\n",
+ 					    (unsigned long long)meta, (unsigned long long)sweet_rheap_pa, SWEET_RHEAP_SIZE);
+ 					frpc = 1;
+ 					frpc_t = t;
+@@ -2528,6 +2578,9 @@ sweet_glink_adsp(void)
+ 			uint32_t cbfsr = asm_g ? smmu_rd(asm_g, (64u + 8u) * 0x1000u + 0x58) : 0;
+ 			printf("SWEET FRPC: waiting for the reply, %d s; apps SMMU sGFSR 0x%x sGFSYNR0 0x%x CB8 FSR 0x%x\n",
+ 			    (t - frpc_t) / 100, gfsr, gsyn, cbfsr);
++			char wh[24];
++			snprintf(wh, sizeof(wh), "+%d s", (t - frpc_t) / 100);
++			sweet_adsp_watch(m, psize, wh);
+ 		}
+ 		if (frpc == 1 && t - frpc_t > 3000) {
+ 			printf("SWEET FRPC: no answer to CREATE_STATIC in 30 s\n");
