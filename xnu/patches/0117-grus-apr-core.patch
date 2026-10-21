@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 4b24798..34cc73b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1771,6 +1771,22 @@ sweet_glink_send(uint16_t cmd, uint16_t p1, uint32_t p2)
+ 	sweet_glink_kick();
+ }
+ 
++/* qcom_glink_smem tx_write: words at head, wrap, head 8-aligned, then kick */
++static void
++sweet_glink_tx(const uint32_t *w, uint32_t words)
++{
++	uint32_t head = GL_DESC(1);
++	for (uint32_t i = 0; i < words; i++) {
++		*(volatile uint32_t *)(sweet_gl.tx + head) = w[i];
++		head = (head + 4) % sweet_gl.txlen;
++	}
++	head = (head + 7u) & ~7u;
++	head %= sweet_gl.txlen;
++	__asm__ volatile("dsb sy" ::: "memory");
++	GL_DESC(1) = head;
++	sweet_glink_kick();
++}
++
+ static uint32_t
+ sweet_glink_rx32(uint32_t off)
+ {
+@@ -1804,8 +1820,40 @@ sweet_glink_adsp(void)
+ 	GL_DESC(1) = 0;                        /* tx head */
+ 	sweet_glink_send(0, 1, 1u << 0);       /* VERSION v1, INTENT_REUSE */
+ 
++	/*
++	 * Step 3 (0117): APR on "apr_audio_svc" (Linux qcom_glink_native open /
++	 * intent / tx_data / rx_done, drivers/soc/qcom/apr.c, q6core): answer
++	 * the ADSP's OPEN with OPEN_ACK and our own OPEN (lcid 1), advertise two
++	 * 4 KiB RX intents once our OPEN is acked, then on a remote intent send
++	 * AVCS_CMD_ADSP_EVENT_GET_STATE (0x1290c) and AVCS_GET_VERSIONS
++	 * (0x12905) to the core service (svc 3, domain apps 5 -> adsp 4) and
++	 * log the answers; RX_DONE_W_REUSE returns our intents.
++	 */
++	const uint32_t lcid = 1;
++	uint32_t apr_rcid = 0, riid = 0, rsize = 0, step = 0;
++	int acked = 0, ravail = 0;
+ 	int opens = 0, msgs = 0;
+-	for (int t = 0; t < 1000 && msgs < 200; t++) {   /* ~10 s */
++	for (int t = 0; t < 1500 && msgs < 400; t++) {   /* ~15 s */
++		if (acked && ravail && step < 2) {
++			static const uint32_t ops[2] = { 0x0001290cu, 0x00012905u };
++			uint32_t w[10];
++			w[0] = 9u | (lcid << 16);      /* TX_DATA, lcid */
++			w[1] = riid;
++			w[2] = 20;                     /* chunk */
++			w[3] = 0;                      /* left */
++			w[4] = 0x150u | (20u << 16);   /* APR hdr_field (SEQ_CMD, 5 words), pkt_size */
++			w[5] = 3u | (5u << 8);         /* src svc core, domain apps, port 0 */
++			w[6] = 3u | (4u << 8);         /* dest svc core, domain adsp, port 0 */
++			w[7] = 0x5eed0000u | step;     /* token */
++			w[8] = ops[step];
++			w[9] = 0;                      /* pad to 8 */
++			if (rsize >= 20) {
++				sweet_glink_tx(w, 10);
++				printf("SWEET APR: tx opcode 0x%x on riid %u\n", ops[step], riid);
++				ravail = 0;
++				step++;
++			}
++		}
+ 		uint32_t head = GL_DESC(3), tail = GL_DESC(2);
+ 		if (head == tail) {
+ 			ud_sleep_ms(10);
+@@ -1835,16 +1883,73 @@ sweet_glink_adsp(void)
+ 			printf("SWEET GLINK: rx OPEN rcid %u \"%s\"\n", p1, name);
+ 			opens++;
+ 			adv = (8 + p2 + 7u) & ~7u;
++			if (strcmp(name, "apr_audio_svc") == 0) {
++				apr_rcid = p1;
++				uint32_t ack[2] = { 4u | ((uint32_t)p1 << 16), 0 };   /* OPEN_ACK rcid */
++				sweet_glink_tx(ack, 2);
++				uint32_t op[6] = { 2u | (lcid << 16), 14, 0, 0, 0, 0 }; /* OPEN lcid, len 14 */
++				bcopy("apr_audio_svc", &op[2], 14);
++				sweet_glink_tx(op, 6);
++				printf("SWEET GLINK: apr_audio_svc: OPEN_ACK %u + OPEN lcid %u sent\n", p1, lcid);
++			}
+ 			break;
+ 		}
++		case 4:                            /* OPEN_ACK of our lcid */
++			printf("SWEET GLINK: rx OPEN_ACK lcid %u\n", p1);
++			if (p1 == lcid && !acked) {
++				acked = 1;
++				for (uint32_t iid = 1; iid <= 2; iid++) {
++					uint32_t in[6] = { 5u | (lcid << 16), 1, 4096, iid, 0, 0 };
++					sweet_glink_tx(in, 4);
++				}
++			}
++			break;
++		case 6:
++		case 14:                           /* RX_DONE(_W_REUSE) of a remote intent */
++			if (p1 == lcid || p1 == apr_rcid) {
++				if (cmd == 14 && p2 == riid) {
++					ravail = 1;
++				}
++			}
++			printf("SWEET GLINK: rx RX_DONE%s cid %u iid %u\n", cmd == 14 ? "_W_REUSE" : "", p1, p2);
++			break;
+ 		case 5:                            /* INTENT: cid, count, count x {size, iid} */
+ 			adv = (8 + p2 * 8 + 7u) & ~7u;
+-			printf("SWEET GLINK: rx INTENT cid %u count %u\n", p1, p2);
++			if (p1 == apr_rcid && apr_rcid != 0 && p2 >= 1) {
++				rsize = sweet_glink_rx32(tail + 8);
++				riid = sweet_glink_rx32(tail + 12);
++				ravail = 1;
++			}
++			printf("SWEET GLINK: rx INTENT cid %u count %u (first size %u iid %u)\n", p1, p2,
++			    sweet_glink_rx32(tail + 8), sweet_glink_rx32(tail + 12));
+ 			break;
+ 		case 9:
+ 		case 12: {                         /* TX_DATA(_CONT): chunk, left, data */
+ 			uint32_t chunk = sweet_glink_rx32(tail + 8);
+ 			adv = (16 + chunk + 7u) & ~7u;
++			if (p1 == apr_rcid && chunk >= 20) {
++				uint32_t d = tail + 16;
++				uint32_t opc = sweet_glink_rx32(d + 16), tok = sweet_glink_rx32(d + 12);
++				uint32_t a0 = chunk >= 24 ? sweet_glink_rx32(d + 20) : 0;
++				uint32_t a1 = chunk >= 28 ? sweet_glink_rx32(d + 24) : 0;
++				uint32_t a2 = chunk >= 32 ? sweet_glink_rx32(d + 28) : 0;
++				uint32_t a3 = chunk >= 36 ? sweet_glink_rx32(d + 32) : 0;
++				printf("SWEET APR: rx opcode 0x%x token 0x%x len %u: 0x%x 0x%x 0x%x 0x%x%s\n", opc, tok,
++				    chunk, a0, a1, a2, a3,
++				    opc == 0x0001290du ? (a0 == 1 ? " (ADSP READY)" : " (adsp not ready)") :
++				    (opc == 0x000110e8u ? " (basic response: opcode, status)" : ""));
++				if (opc == 0x00012906u) {   /* versions: build id, count, {svc, ver}... */
++					uint32_t n = a1 < 24 ? a1 : 24;
++					for (uint32_t k = 0; k < n && 28 + 8 * k + 8 <= chunk; k++) {
++						printf("SWEET APR:   service 0x%x version 0x%x\n",
++						    sweet_glink_rx32(d + 28 + 8 * k), sweet_glink_rx32(d + 32 + 8 * k));
++					}
++				}
++				uint32_t done[2] = { 14u | (lcid << 16), p2 };      /* RX_DONE_W_REUSE liid */
++				GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
++				sweet_glink_tx(done, 2);
++				continue;
++			}
+ 			printf("SWEET GLINK: rx DATA cid %u chunk %u\n", p1, chunk);
+ 			break;
+ 		}
