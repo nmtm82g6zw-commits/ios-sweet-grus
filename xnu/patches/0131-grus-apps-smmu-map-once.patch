@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 95bf9da..f5d7009 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -68,6 +68,7 @@ static void sweet_adsp_thread(void *arg, wait_result_t wr);
+ static void sweet_glink_adsp(void);
+ static void sweet_amp_pins(void);
+ static void sweet_amp_power(int on);
++static vm_offset_t sweet_asmmu_va(void);
+ static void sweet_gpu_cx_on(vm_offset_t gcc, vm_offset_t cc);
+ static void sweet_gpu_late_thread(void *arg, wait_result_t wr);
+ static struct { vm_offset_t gcc, cc, gmu; } sweet_gpu_late;
+@@ -1858,7 +1859,7 @@ static uint8_t sweet_hyp_buf[0x1000] __attribute__((aligned(0x1000)));
+ static int
+ sweet_apps_smmu_identity(const uint16_t *sids, unsigned nsid, const char *name)
+ {
+-	vm_offset_t s = ml_io_map(0x15000000, 0x80000);
++	vm_offset_t s = sweet_asmmu_va();
+ 	if (s == 0) {
+ 		return -1;
+ 	}
+@@ -2473,7 +2474,7 @@ sweet_glink_adsp(void)
+ 	bzero(&qs, sizeof(qs));
+ 	qs.adsp_node = 5;
+ 	int frpc_ret = -1;
+-	vm_offset_t asm_g = ml_io_map(0x15000000, 0x80000);
++	vm_offset_t asm_g = sweet_asmmu_va();
+ 	for (int t = 0; t < 12000 && msgs < 4000 && step < nsteps; t++) {   /* ~120 s */
+ 		if (qs.served && qs.notif_port && !qs.registered && ch[1].acked) {
+ 			sweet_pdr_register(&ch[1], &qs);
+@@ -3467,6 +3468,21 @@ sweet_qmp_send(const char *msg)
+ 	return r;
+ }
+ 
++/*
++ * 0131: k50 panicked in kmem_alloc(io_submap, 0x80000): the apps SMMU was
++ * mapped three times (dump, identity, wait loop) and the 8 MiB io_submap
++ * ran out. Map it once.
++ */
++static vm_offset_t
++sweet_asmmu_va(void)
++{
++	static vm_offset_t va;
++	if (!va) {
++		va = ml_io_map(0x15000000, 0x80000);
++	}
++	return va;
++}
++
+ /*
+  * 0125: read-only dump of the apps SMMU (qcom,qsmmu-v500 = MMU-500 at
+  * 0x15000000, 0x80000; grus DT "qcom,skip-init": the bootloader/hypervisor
+@@ -3478,7 +3494,7 @@ sweet_qmp_send(const char *msg)
+ static void
+ sweet_apps_smmu_dump(void)
+ {
+-	vm_offset_t s = ml_io_map(0x15000000, 0x80000);
++	vm_offset_t s = sweet_asmmu_va();
+ 	if (s == 0) {
+ 		return;
+ 	}
