@@ -1,0 +1,198 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ea7f5da..fd6f01d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1830,7 +1830,13 @@ sweet_glch_send(struct sweet_glch *c, const uint32_t *data, uint32_t bytes)
+ 	return 0;
+ }
+ 
++struct sweet_qrtr_st {
++	uint32_t adsp_node, notif_node, notif_port, audio_state, txn;
++	int served, registered, state_known;
++};
++
+ #define QRTR_CTRL_PORT   0xfffffffeu
++#define SWEET_PDR_PORT   0x4001u
+ #define SWEET_LOC_PORT   0x4000u
+ 
+ /* QRTR v1 packet from node 1. */
+@@ -1924,7 +1930,7 @@ sweet_pdm_domain_list(const char *service, uint32_t offset, uint8_t *b, uint32_t
+ }
+ 
+ static void
+-sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_node, int *served)
++sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, struct sweet_qrtr_st *q)
+ {
+ 	uint8_t pkt[512];
+ 	uint32_t n = chunk < sizeof(pkt) ? chunk : sizeof(pkt);
+@@ -1962,7 +1968,7 @@ sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_n
+ 	const uint8_t *pl = pkt + hl;
+ 	uint32_t pw[5] = { 0 };
+ 	bcopy(pl, pw, size < 20 ? size : 20);
+-	*adsp_node = snode;
++	q->adsp_node = snode;
+ 	switch (type) {
+ 	case 2: {                                  /* HELLO */
+ 		printf("SWEET QRTR: HELLO from node %u (v%u)%s\n", snode, pkt[0], c->hello ? ", already answered" : "");
+@@ -1979,6 +1985,10 @@ sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_n
+ 	case 4:                                    /* NEW_SERVER */
+ 		printf("SWEET QRTR: NEW_SERVER service 0x%x instance 0x%x node %u port 0x%x%s\n",
+ 		    pw[1], pw[2], pw[3], pw[4], pw[1] == 0x42 ? " (servreg notifier)" : "");
++		if (pw[1] == 0x42 && (pw[2] >> 8) == 74) {
++			q->notif_node = pw[3];
++			q->notif_port = pw[4];
++		}
+ 		break;
+ 	case 5:
+ 		printf("SWEET QRTR: DEL_SERVER service 0x%x instance 0x%x\n", pw[1], pw[2]);
+@@ -1997,6 +2007,55 @@ sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_n
+ 		uint32_t qlen = pl[5] | (pl[6] << 8);
+ 		printf("SWEET QMI: from %u:0x%x to port 0x%x type %u txn %u msg 0x%x len %u\n",
+ 		    snode, sport, dport, qtype, txn, msg, qlen);
++		if (dport == SWEET_PDR_PORT && (msg == 0x20 || msg == 0x22 || msg == 0x23)) {
++			uint32_t state = 0, tid = 0, result = 0xffff;
++			int have_state = 0;
++			char path[66] = { 0 };
++			for (uint32_t qq = 7; qq + 3 <= 7 + qlen && qq + 3 <= size;) {
++				uint32_t tt = pl[qq], tl = pl[qq + 1] | (pl[qq + 2] << 8);
++				const uint8_t *v = pl + qq + 3;
++				if (qq + 3 + tl > size) {
++					break;
++				}
++				if (qtype == 2 && tt == 0x02 && tl >= 4) {
++					result = v[0] | (v[1] << 8) | ((uint32_t)(v[2] | (v[3] << 8)) << 16);
++				} else if ((qtype == 2 && tt == 0x10 && tl == 4) || (qtype == 4 && tt == 0x01 && tl == 4)) {
++					bcopy(v, &state, 4);
++					have_state = 1;
++				} else if (qtype == 4 && tt == 0x02) {
++					uint32_t sl = tl < 65 ? tl : 65;
++					bcopy(v, path, sl);
++					path[sl] = 0;
++				} else if (qtype == 4 && tt == 0x03 && tl == 2) {
++					tid = v[0] | (v[1] << 8);
++				}
++				qq += 3 + tl;
++			}
++			const char *sn = state == 0x1fffffffu ? "UP" : state == 0x0fffffffu ? "DOWN" :
++			    state == 0x2fffffffu ? "EARLY_DOWN" : state == 0x7fffffffu ? "UNINIT" : "?";
++			if (msg == 0x20) {
++				printf("SWEET PDR: register listener audio_pd: result 0x%x state 0x%x (%s)\n",
++				    result, state, have_state ? sn : "none");
++			} else if (msg == 0x22) {
++				printf("SWEET PDR: STATE_UPDATED \"%s\" -> 0x%x (%s) tid %u: ack\n", path, state, sn, tid);
++				uint8_t ack[7 + 3 + 65 + 5];
++				uint32_t pn = (uint32_t)strlen(path), al = 7;
++				ack[0] = 0; ack[1] = (uint8_t)++q->txn; ack[2] = 0; ack[3] = 0x23; ack[4] = 0;
++				ack[al++] = 0x01; ack[al++] = (uint8_t)pn; ack[al++] = 0;
++				bcopy(path, ack + al, pn);
++				al += pn;
++				ack[al++] = 0x02; ack[al++] = 2; ack[al++] = 0;
++				ack[al++] = (uint8_t)tid; ack[al++] = (uint8_t)(tid >> 8);
++				ack[5] = (uint8_t)(al - 7); ack[6] = 0;
++				sweet_qrtr_tx(c, 1, SWEET_PDR_PORT, snode, sport, ack, al);
++			} else {
++				printf("SWEET PDR: SET_ACK response result 0x%x\n", result);
++			}
++			if (have_state) {
++				q->audio_state = state;
++				q->state_known = 1;
++			}
++		}
+ 		if (dport == SWEET_LOC_PORT && qtype == 0) {
+ 			char svc[66] = { 0 };
+ 			uint32_t off = 0;
+@@ -2019,7 +2078,7 @@ sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_n
+ 			if (msg == 0x21) {
+ 				printf("SWEET PDM: GET_DOMAIN_LIST \"%s\"\n", svc);
+ 				rl = sweet_pdm_domain_list(svc, off, rsp, txn);
+-				(*served)++;
++				q->served++;
+ 			} else {
+ 				/* PFR or anything else: plain success response */
+ 				printf("SWEET PDM: request 0x%x (%s) acknowledged\n", msg, msg == 0x24 ? "PFR" : "?");
+@@ -2042,6 +2101,25 @@ sweet_qrtr_rx(struct sweet_glch *c, uint32_t d, uint32_t chunk, uint32_t *adsp_n
+ 	}
+ }
+ 
++/* pdr_interface.c pdr_register_listener: enable 1, service path. */
++static void
++sweet_pdr_register(struct sweet_glch *c, struct sweet_qrtr_st *q)
++{
++	static const char path[] = "msm/adsp/audio_pd";
++	uint8_t b[7 + 4 + 3 + sizeof(path)];
++	uint32_t p = 7, pn = sizeof(path) - 1;
++	b[0] = 0; b[1] = (uint8_t)++q->txn; b[2] = 0; b[3] = 0x20; b[4] = 0;
++	b[p++] = 0x01; b[p++] = 1; b[p++] = 0; b[p++] = 1;          /* enable */
++	b[p++] = 0x02; b[p++] = (uint8_t)pn; b[p++] = 0;
++	bcopy(path, b + p, pn);
++	p += pn;
++	b[5] = (uint8_t)(p - 7); b[6] = 0;
++	if (sweet_qrtr_tx(c, 1, SWEET_PDR_PORT, q->notif_node, q->notif_port, b, p) == 0) {
++		q->registered = 1;
++		printf("SWEET PDR: REGISTER_LISTENER \"%s\" -> %u:0x%x\n", path, q->notif_node, q->notif_port);
++	}
++}
++
+ /* qcom_q6v5_pas adsp: crash_reason_smem 423 (global heap item). */
+ static void
+ sweet_adsp_crash_reason(void)
+@@ -2107,9 +2185,11 @@ sweet_glink_adsp(void)
+ 	 *    "avs/audio" -> msm/adsp/audio_pd 74, "tms/servreg" -> all sdm670
+ 	 *    domains; PFR (0x24) is acknowledged. k40 showed the core (root PD)
+ 	 *    answering while AFE stayed silent: the audio PD most likely waits
+-	 *    for this locator. AFE steps start once a domain list was served
+-	 *    (+3 s) or after 20 s regardless; services announced by the ADSP
+-	 *    (NEW_SERVER) are logged.
++	 *    for this locator. 0122: as a PDR client (pdr_interface.c) we then
++	 *    register a listener for msm/adsp/audio_pd on the ADSP servreg
++	 *    notifier (0x42, instance 74), log its state, ack STATE_UPDATED
++	 *    indications, and start the AFE steps 1 s after it reports UP
++	 *    (or after 30 s regardless).
+ 	 */
+ 	enum { A_NONE, A_PINS, A_AMP_ON, A_AMP_OFF };
+ 	static const struct {
+@@ -2137,10 +2217,18 @@ sweet_glink_adsp(void)
+ 	ch[0].lcid = 1;
+ 	ch[1].lcid = 2;
+ 	unsigned step = 0;
+-	int opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0, served_t = -1, served = 0;
+-	uint32_t adsp_node = 5;
++	int opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0, up_t = -1;
++	struct sweet_qrtr_st qs;
++	bzero(&qs, sizeof(qs));
++	qs.adsp_node = 5;
+ 	for (int t = 0; t < 6000 && msgs < 2000 && step < nsteps; t++) {   /* ~60 s */
+-		int afe_go = step < 1 || (served && t - served_t > 300) || t > 2000;
++		if (qs.served && qs.notif_port && !qs.registered && ch[1].acked) {
++			sweet_pdr_register(&ch[1], &qs);
++		}
++		if (up_t < 0 && qs.state_known && qs.audio_state == 0x1fffffffu) {
++			up_t = t;
++		}
++		int afe_go = step < 1 || (up_t >= 0 && t - up_t > 100) || t > 3000;
+ 		if (ch[0].acked && !waiting && afe_go) {
+ 			uint32_t w[17] = { 0 };
+ 			uint32_t svc = steps[step].svc, bytes = 20 + 4u * steps[step].n;
+@@ -2273,10 +2361,7 @@ sweet_glink_adsp(void)
+ 			uint32_t d = tail + 16;
+ 			if (c == &ch[1]) {
+ 				if (cmd == 9 && left == 0) {
+-					sweet_qrtr_rx(&ch[1], d, chunk, &adsp_node, &served);
+-					if (served == 1 && served_t < 0) {
+-						served_t = t;
+-					}
++					sweet_qrtr_rx(&ch[1], d, chunk, &qs);
+ 				} else {
+ 					printf("SWEET QRTR: fragmented packet (chunk %u left %u) ignored\n", chunk, left);
+ 				}
+@@ -2333,8 +2418,8 @@ sweet_glink_adsp(void)
+ 		}
+ 		GL_DESC(2) = (tail + adv) % sweet_gl.rxlen;
+ 	}
+-	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; locator served %d; desc tx %u/%u rx %u/%u\n",
+-	    msgs, opens, step, nsteps, served, GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
++	GPU_STEP("SWEET GLINK: %d messages, %d channels offered by the ADSP; APR steps %u/%u; locator served %d; audio_pd state 0x%x%s; desc tx %u/%u rx %u/%u\n",
++	    msgs, opens, step, nsteps, qs.served, qs.audio_state, qs.state_known ? "" : " (unknown)", GL_DESC(0), GL_DESC(1), GL_DESC(2), GL_DESC(3));
+ 	sweet_adsp_crash_reason();
+ }
+ 
