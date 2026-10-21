@@ -1,0 +1,307 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fec044e..0f3e4bc 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1796,6 +1796,188 @@ sweet_glink_rx32(uint32_t off)
+ 	return usb_rd(sweet_gl.rx, off % sweet_gl.rxlen);
+ }
+ 
++/*
++ * 0126: audio PD static process, like grus Android's "adsprpcd audiopd"
++ * (Xiaomi grus-p-oss drivers/char/adsprpc.c, FASTRPC_INIT_CREATE_STATIC):
++ *  1. apps SMMU: k45 showed 7 stream match groups (USB 0x740 CB2, MDP CB3,
++ *     ...) and unmatched streams fault, so the ADSP's FastRPC/audio streams
++ *     0x1800-0x180f (msm-audio-ion 0x1801, adsprpc cb9-12 0x1803-0x1806)
++ *     get an identity context bank (SCTLR.M=0), as ios-topaz does for WLAN;
++ *  2. the remote heap (adsp_region: 8 MiB, 4 MiB aligned, below 4 GiB) is
++ *     handed to VMIDs 0x16/0x25 RWX with hyp_assign (SCM MP 0x16);
++ *  3. on "fastrpcglink-apps-dsp": invoke handle 1, method 8, 3 in-buffers
++ *     {pgid, namelen 8, pageslen 1}, "audiopd", {heap pa, size}; the
++ *     argument block (rpra, list, pages, fdlist, crclist, args aligned to
++ *     128) sits in identity-mapped memory.
++ */
++#define SWEET_RHEAP_SIZE 0x800000u
++static vm_offset_t sweet_rheap_va;
++static uint64_t sweet_rheap_pa;
++static int sweet_rheap_ok;
++static uint8_t sweet_frpc_meta[0x1000] __attribute__((aligned(0x1000)));
++static uint8_t sweet_hyp_buf[0x1000] __attribute__((aligned(0x1000)));
++
++static int
++sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
++{
++	vm_offset_t s = ml_io_map(0x15000000, 0x80000);
++	if (s == 0) {
++		return -1;
++	}
++	uint32_t cr0 = smmu_rd(s, 0x0), id0 = smmu_rd(s, 0x20), id1 = smmu_rd(s, 0x24);
++	uint32_t nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++	uint32_t psz = (id1 >> 31) ? 0x10000u : 0x1000u, npage = 1u << (((id1 >> 28) & 7u) + 1);
++	uint32_t slot = ~0u, cb = ~0u, smr, s2cr;
++	uint64_t used = 0;
++	if ((cr0 >> 3) & 1) {
++		printf("SWEET ASMMU: extended stream IDs on, identity skipped\n");
++		return -1;
++	}
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		smr = smmu_rd(s, 0x800 + 4 * i);
++		s2cr = smmu_rd(s, 0xc00 + 4 * i);
++		uint32_t id = smr & 0xffffu, m = (smr >> 16) & 0x7fffu;
++		if ((smr >> 31) && ((id ^ sid) & ~(m | mask) & 0x7fffu) == 0) {
++			slot = i;
++		} else if (!(smr >> 31) && slot == ~0u) {
++			slot = i;
++		}
++		if ((smr >> 31) && ((s2cr >> 16) & 3u) == 0) {
++			used |= 1ull << (s2cr & 0x3fu);
++		}
++	}
++	for (uint32_t i = 8; i < ncb && i < 64; i++) {
++		if (!(used & (1ull << i))) {
++			cb = i;
++			break;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (npage + cb + 1) * psz > 0x80000) {
++		printf("SWEET ASMMU: no free SMR/CB for %s (slot %u cb %u)\n", name, slot, cb);
++		return -1;
++	}
++	vm_offset_t gr1 = s + psz, cbp = s + npage * psz + cb * psz;
++	smmu_wr(cbp, 0x58, 0xffffffffu);
++	smmu_wr(cbp, 0x20, 0);
++	smmu_wr(cbp, 0x24, 0);
++	smmu_wr(cbp, 0x30, 0);
++	smmu_wr(cbp, 0x10, 0);
++	smmu_wr(cbp, 0x38, 0);
++	smmu_wr(cbp, 0x3c, 0);
++	smmu_wr(gr1, 0x800 + 4 * cb, 1);             /* CBA2R VA64 */
++	smmu_wr(gr1, 4 * cb, 0x0001f000u);           /* CBAR S1 trans, S2 fault, WB */
++	smmu_wr(cbp, 0x0, 0xe0u);                    /* SCTLR: M=0, fault reporting */
++	smmu_wr(s, 0xc00 + 4 * slot, cb);            /* S2CR translate -> cb */
++	smmu_wr(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);
++	smmu_wr(s, 0x70, 0);                         /* sTLBGSYNC */
++	for (int n = 0; n < 100000 && (smmu_rd(s, 0x74) & 1u); n++) {
++		delay(1);
++	}
++	smr = smmu_rd(s, 0x800 + 4 * slot);
++	s2cr = smmu_rd(s, 0xc00 + 4 * slot);
++	int ok = (smr >> 31) && (smr & 0xffffu) == sid && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb;
++	printf("SWEET ASMMU: %s identity sid 0x%x mask 0x%x CB%u SMR%u: SMR 0x%08x S2CR 0x%08x SCTLR 0x%08x -> %s\n",
++	    name, sid, mask, cb, slot, smr, s2cr, smmu_rd(cbp, 0x0), ok ? "OK" : "NOT as written");
++	return ok ? 0 : -1;
++}
++
++/* SMC with arguments 3.. in a buffer (qcom_scm-smc.c, > 4 arguments). */
++static uint64_t
++sweet_smc_ext(uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t ext_pa)
++{
++	uint64_t a6 = 0, ret = 0, fn = 0x42000000ull | (svc << 8) | cmd;
++	for (int n = 0; n < 100000; n++) {
++		register uint64_t x0 __asm__("x0") = fn;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = ext_pa;
++		register uint64_t x6 __asm__("x6") = a6;
++		__asm__ volatile("dsb sy\n\tsmc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++		    "+r"(x4), "+r"(x5), "+r"(x6) : : "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "memory");
++		ret = x0;
++		if (ret != 1) {
++			break;
++		}
++		fn = 1;
++		a6 = x6;
++	}
++	return ret;
++}
++
++static void
++sweet_remote_heap(void)
++{
++	if (kmem_alloc_contig(kernel_map, &sweet_rheap_va, SWEET_RHEAP_SIZE, PAGE_MASK,
++	    (ppnum_t)atop_64(0x100000000ull) - 1, (ppnum_t)atop_64(0x400000ull) - 1,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET FRPC: no %u-byte contiguous remote heap\n", SWEET_RHEAP_SIZE);
++		return;
++	}
++	ppnum_t p0 = pmap_find_phys(kernel_pmap, (addr64_t)sweet_rheap_va);
++	ppnum_t p1 = pmap_find_phys(kernel_pmap, (addr64_t)sweet_rheap_va + SWEET_RHEAP_SIZE - PAGE_SIZE);
++	sweet_rheap_pa = ptoa_64(p0);
++	if (!p0 || ptoa_64(p1) != sweet_rheap_pa + SWEET_RHEAP_SIZE - PAGE_SIZE || (sweet_rheap_pa & 0x3fffffu) ||
++	    sweet_rheap_pa + SWEET_RHEAP_SIZE > 0x100000000ull) {
++		printf("SWEET FRPC: remote heap pa 0x%llx not usable\n", (unsigned long long)sweet_rheap_pa);
++		return;
++	}
++	FlushPoC_DcacheRegion(sweet_rheap_va, SWEET_RHEAP_SIZE);
++	/* qcom_scm_assign_mem: mem list @0, src vmids @64, dest perms @128, ext args @256 */
++	uint8_t *b = sweet_hyp_buf;
++	uint64_t bpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)b)) + ((uintptr_t)b & PAGE_MASK);
++	bzero(b, 512);
++	uint64_t *mem = (uint64_t *)(void *)b;
++	mem[0] = sweet_rheap_pa;
++	mem[1] = SWEET_RHEAP_SIZE;
++	*(uint32_t *)(void *)(b + 64) = 3;                      /* VMID_HLOS */
++	uint32_t *d = (uint32_t *)(void *)(b + 128);
++	d[0] = 0x16; d[1] = 7;                                  /* vmid, RWX; ctx 0, ctx_size 0 */
++	d[6] = 0x25; d[7] = 7;
++	uint64_t *ext = (uint64_t *)(void *)(b + 256);
++	ext[0] = 4;                                             /* src list size */
++	ext[1] = bpa + 128;                                     /* dest list */
++	ext[2] = 48;                                            /* 2 x 24 bytes */
++	ext[3] = 0;
++	FlushPoC_DcacheRegion((vm_offset_t)b, 512);
++	uint64_t r = sweet_smc_ext(0x0c, 0x16, 0x1117, bpa, 16, bpa + 64, bpa + 256);
++	sweet_rheap_ok = (r == 0);
++	printf("SWEET FRPC: remote heap 0x%llx+0x%x hyp_assign HLOS -> 0x16/0x25 RWX: ret %lld%s\n",
++	    (unsigned long long)sweet_rheap_pa, SWEET_RHEAP_SIZE, (long long)r, r ? "" : " (assigned, apps no longer touches it)");
++}
++
++/* Build the CREATE_STATIC argument block; returns its physical address. */
++static uint64_t
++sweet_frpc_create_static_args(uint32_t pgid)
++{
++	uint8_t *m = sweet_frpc_meta;
++	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)m)) + ((uintptr_t)m & PAGE_MASK);
++	bzero(m, sizeof(sweet_frpc_meta));
++	/* rpra[3] @0 (16 B), list[3] @48 (8 B), pages[3] @72 (16 B), fdlist @120, crclist @248, meta 504 */
++	static const uint32_t off[3] = { 512, 640, 768 }, len[3] = { 12, 8, 16 };
++	uint32_t inbuf[3] = { pgid, 8, 1 };
++	bcopy(inbuf, m + 512, 12);
++	bcopy("audiopd", m + 640, 8);
++	uint64_t pg[2] = { sweet_rheap_pa, SWEET_RHEAP_SIZE };
++	bcopy(pg, m + 768, 16);
++	for (unsigned i = 0; i < 3; i++) {
++		uint64_t a = pa + off[i];
++		uint64_t *rp = (uint64_t *)(void *)(m + 16 * i);
++		rp[0] = a;                                      /* pv: low bits = offset in page */
++		rp[1] = len[i];
++		int32_t *l = (int32_t *)(void *)(m + 48 + 8 * i);
++		l[0] = 1;
++		l[1] = (int32_t)i;
++		uint64_t *p = (uint64_t *)(void *)(m + 72 + 16 * i);
++		p[0] = a & ~0xfffull;
++		p[1] = 0x1000;
++	}
++	FlushPoC_DcacheRegion((vm_offset_t)m, sizeof(sweet_frpc_meta));
++	return pa;
++}
++
+ /* 0121: per-channel GLINK state and remote-intent pool. */
+ struct sweet_glch {
+ 	uint32_t lcid, rcid, npool, extra;
+@@ -2218,12 +2400,14 @@ sweet_glink_adsp(void)
+ 		  { 32, 0, 0, 0, 0x0001028f, 0x00010290, 20, 1, 0x100, 0, 1, 0 }, "AFE clock PRI_MI2S_IBIT off" },
+ 	};
+ 	const unsigned nsteps = sizeof(steps) / sizeof(steps[0]);
+-	static const char *const chname[3] = { "apr_audio_svc", "IPCRTR", "apr_apps2" };
+-	struct sweet_glch ch[3];
++	static const char *const chname[4] = { "apr_audio_svc", "IPCRTR", "apr_apps2", "fastrpcglink-apps-dsp" };
++	struct sweet_glch ch[4];
+ 	bzero(ch, sizeof(ch));
+ 	ch[0].lcid = 1;
+ 	ch[1].lcid = 2;
+ 	ch[2].lcid = 3;
++	ch[3].lcid = 4;
++	int frpc = 0, frpc_t = 0, frpc_req = 0;
+ 	unsigned step = 0, afe_ch = 0;
+ 	int opens = 0, msgs = 0, waiting = 0, wait_t = 0, start_ok = 0, up_t = -1;
+ 	struct sweet_qrtr_st qs;
+@@ -2236,7 +2420,42 @@ sweet_glink_adsp(void)
+ 		if (up_t < 0 && qs.state_known && qs.audio_state == 0x1fffffffu) {
+ 			up_t = t;
+ 		}
+-		int afe_go = step < 1 || (up_t >= 0 && t - up_t > 100) || t > 3000;
++		/* 0126: create the audio PD static process once audio_pd is UP */
++		if (frpc == 0 && up_t >= 0 && ch[3].acked) {
++			if (!sweet_rheap_ok) {
++				printf("SWEET FRPC: no remote heap, CREATE_STATIC skipped\n");
++				frpc = 3;
++			} else {
++				uint32_t msg[10];
++				uint64_t meta = sweet_frpc_create_static_args(0x5eed);
++				msg[0] = 0x5eed;                       /* pid (adsprpcd tgid) */
++				msg[1] = 0x5eee;                       /* tid */
++				msg[2] = 0x5eed0000u | (1u << 4) | 1u; /* ctx: id | static pd */
++				msg[3] = 0;
++				msg[4] = 1;                            /* handle 1 */
++				msg[5] = (8u << 24) | (3u << 16);      /* REMOTE_SCALARS_MAKE(8, 3, 0) */
++				msg[6] = (uint32_t)meta;
++				msg[7] = (uint32_t)(meta >> 32);
++				msg[8] = 0x1000;                       /* buf_page_size(784) */
++				msg[9] = 0;
++				if (sweet_glch_send(&ch[3], msg, 40) == 0) {
++					printf("SWEET FRPC: CREATE_STATIC \"audiopd\" sent (args at 0x%llx, heap 0x%llx+0x%x)\n",
++					    (unsigned long long)meta, (unsigned long long)sweet_rheap_pa, SWEET_RHEAP_SIZE);
++					frpc = 1;
++					frpc_t = t;
++				} else if (!frpc_req) {
++					uint32_t rq[2] = { 7u | (ch[3].lcid << 16), 40 };   /* RX_INTENT_REQ */
++					sweet_glink_tx(rq, 2);
++					frpc_req = 1;
++					printf("SWEET FRPC: no remote intent yet, requested one\n");
++				}
++			}
++		}
++		if (frpc == 1 && t - frpc_t > 500) {
++			printf("SWEET FRPC: no answer to CREATE_STATIC in 5 s\n");
++			frpc = 3;
++		}
++		int afe_go = step < 1 || ((frpc >= 2) && t - frpc_t > 100) || t > 3500;
+ 		unsigned sc = steps[step].chn == 9 ? afe_ch : steps[step].chn;
+ 		if (!waiting && afe_go && steps[step].chn == 2 && !ch[2].acked && t > 3500) {
+ 			printf("SWEET APR: step %u %s: apr_apps2 not open, skipped\n", step, steps[step].what);
+@@ -2281,7 +2500,7 @@ sweet_glink_adsp(void)
+ 		uint16_t cmd = (uint16_t)w0, p1 = (uint16_t)(w0 >> 16);
+ 		uint32_t adv = 8;
+ 		struct sweet_glch *c = NULL;
+-		for (unsigned k = 0; k < 3; k++) {
++		for (unsigned k = 0; k < 4; k++) {
+ 			if (ch[k].rcid != 0 && ch[k].rcid == p1) {
+ 				c = &ch[k];
+ 			}
+@@ -2307,7 +2526,7 @@ sweet_glink_adsp(void)
+ 			printf("SWEET GLINK: rx OPEN rcid %u \"%s\"\n", p1, name);
+ 			opens++;
+ 			adv = (8 + p2 + 7u) & ~7u;
+-			for (unsigned k = 0; k < 3; k++) {
++			for (unsigned k = 0; k < 4; k++) {
+ 				if (strcmp(name, chname[k]) == 0 && ch[k].rcid == 0) {
+ 					uint32_t nl = (uint32_t)strlen(chname[k]) + 1;
+ 					ch[k].rcid = p1;
+@@ -2323,7 +2542,7 @@ sweet_glink_adsp(void)
+ 		}
+ 		case 4:                            /* OPEN_ACK of our lcid */
+ 			printf("SWEET GLINK: rx OPEN_ACK lcid %u\n", p1);
+-			for (unsigned k = 0; k < 3; k++) {
++			for (unsigned k = 0; k < 4; k++) {
+ 				if (p1 == ch[k].lcid && !ch[k].acked) {
+ 					ch[k].acked = 1;
+ 					for (uint32_t iid = 1; iid <= 4; iid++) {
+@@ -2373,7 +2592,15 @@ sweet_glink_adsp(void)
+ 			uint32_t chunk = sweet_glink_rx32(tail + 8), left = sweet_glink_rx32(tail + 12);
+ 			adv = (16 + chunk + 7u) & ~7u;
+ 			uint32_t d = tail + 16;
+-			if (c == &ch[1]) {
++			if (c == &ch[3]) {
++				uint32_t r0 = sweet_glink_rx32(d), r1 = sweet_glink_rx32(d + 4), r2 = sweet_glink_rx32(d + 8);
++				printf("SWEET FRPC: rx chunk %u: ctx 0x%08x%08x retval %d (0x%x)%s\n", chunk, r1, r0, (int)r2, r2,
++				    (frpc == 1 && r0 == (0x5eed0000u | 0x11u)) ? (r2 == 0 ? " -> audiopd CREATED" : " -> CREATE_STATIC failed") : "");
++				if (frpc == 1 && r0 == (0x5eed0000u | 0x11u)) {
++					frpc = 2;
++					frpc_t = t;
++				}
++			} else if (c == &ch[1]) {
+ 				if (cmd == 9 && left == 0) {
+ 					sweet_qrtr_rx(&ch[1], d, chunk, &qs);
+ 				} else {
+@@ -3234,6 +3461,8 @@ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 	sweet_apps_smmu_dump();
+ 	sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp before");
+ 	(void)sweet_qmp_send("{class: image, res: load_state, name: adsp, val: on}");
++	(void)sweet_apps_smmu_identity(0x1800, 0xf, "ADSP audio/FastRPC");
++	sweet_remote_heap();
+ 	if (sweet_pas_boot("adsp", 1, 0x93e00000u, 0x2200000u) == 0) {
+ 		ud_sleep_ms(2000);
+ 		sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp");
