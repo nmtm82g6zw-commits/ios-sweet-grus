@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0f3e4bc..4749af0 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1814,11 +1814,16 @@ sweet_glink_rx32(uint32_t off)
+ static vm_offset_t sweet_rheap_va;
+ static uint64_t sweet_rheap_pa;
+ static int sweet_rheap_ok;
+-static uint8_t sweet_frpc_meta[0x1000] __attribute__((aligned(0x1000)));
+ static uint8_t sweet_hyp_buf[0x1000] __attribute__((aligned(0x1000)));
+ 
++/*
++ * 0127: k46 showed the S2CR/CB writes landing but the SMR with mask 0xf
++ * reading back 0, exactly like the GPU SMMU in 0098 (masked SMRs are
++ * dropped by the hypervisor): one SMR per stream ID, mask 0, all routed
++ * to the same identity context bank.
++ */
+ static int
+-sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
++sweet_apps_smmu_identity(const uint16_t *sids, unsigned nsid, const char *name)
+ {
+ 	vm_offset_t s = ml_io_map(0x15000000, 0x80000);
+ 	if (s == 0) {
+@@ -1827,7 +1832,7 @@ sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	uint32_t cr0 = smmu_rd(s, 0x0), id0 = smmu_rd(s, 0x20), id1 = smmu_rd(s, 0x24);
+ 	uint32_t nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
+ 	uint32_t psz = (id1 >> 31) ? 0x10000u : 0x1000u, npage = 1u << (((id1 >> 28) & 7u) + 1);
+-	uint32_t slot = ~0u, cb = ~0u, smr, s2cr;
++	uint32_t cb = ~0u, smr, s2cr;
+ 	uint64_t used = 0;
+ 	if ((cr0 >> 3) & 1) {
+ 		printf("SWEET ASMMU: extended stream IDs on, identity skipped\n");
+@@ -1836,12 +1841,6 @@ sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+ 		smr = smmu_rd(s, 0x800 + 4 * i);
+ 		s2cr = smmu_rd(s, 0xc00 + 4 * i);
+-		uint32_t id = smr & 0xffffu, m = (smr >> 16) & 0x7fffu;
+-		if ((smr >> 31) && ((id ^ sid) & ~(m | mask) & 0x7fffu) == 0) {
+-			slot = i;
+-		} else if (!(smr >> 31) && slot == ~0u) {
+-			slot = i;
+-		}
+ 		if ((smr >> 31) && ((s2cr >> 16) & 3u) == 0) {
+ 			used |= 1ull << (s2cr & 0x3fu);
+ 		}
+@@ -1852,8 +1851,8 @@ sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 			break;
+ 		}
+ 	}
+-	if (slot == ~0u || cb == ~0u || (npage + cb + 1) * psz > 0x80000) {
+-		printf("SWEET ASMMU: no free SMR/CB for %s (slot %u cb %u)\n", name, slot, cb);
++	if (cb == ~0u || (npage + cb + 1) * psz > 0x80000) {
++		printf("SWEET ASMMU: no free context bank for %s\n", name);
+ 		return -1;
+ 	}
+ 	vm_offset_t gr1 = s + psz, cbp = s + npage * psz + cb * psz;
+@@ -1867,18 +1866,39 @@ sweet_apps_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	smmu_wr(gr1, 0x800 + 4 * cb, 1);             /* CBA2R VA64 */
+ 	smmu_wr(gr1, 4 * cb, 0x0001f000u);           /* CBAR S1 trans, S2 fault, WB */
+ 	smmu_wr(cbp, 0x0, 0xe0u);                    /* SCTLR: M=0, fault reporting */
+-	smmu_wr(s, 0xc00 + 4 * slot, cb);            /* S2CR translate -> cb */
+-	smmu_wr(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);
++	int bad = 0;
++	for (unsigned k = 0; k < nsid; k++) {
++		uint32_t slot = ~0u;
++		for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++			smr = smmu_rd(s, 0x800 + 4 * i);
++			if ((smr >> 31) && (smr & 0xffffu) == sids[k] && ((smr >> 16) & 0x7fffu) == 0) {
++				slot = i;
++				break;
++			}
++			if (!(smr >> 31) && slot == ~0u) {
++				slot = i;
++			}
++		}
++		if (slot == ~0u) {
++			printf("SWEET ASMMU: no free SMR for sid 0x%x\n", sids[k]);
++			bad++;
++			continue;
++		}
++		smmu_wr(s, 0xc00 + 4 * slot, cb);        /* S2CR translate -> cb */
++		smmu_wr(s, 0x800 + 4 * slot, (1u << 31) | sids[k]);
++		smr = smmu_rd(s, 0x800 + 4 * slot);
++		s2cr = smmu_rd(s, 0xc00 + 4 * slot);
++		int ok = smr == ((1u << 31) | sids[k]) && s2cr == cb;
++		bad += !ok;
++		printf("SWEET ASMMU: %s sid 0x%x -> SMR%u 0x%08x S2CR 0x%08x CB%u%s\n", name, sids[k], slot, smr, s2cr, cb,
++		    ok ? "" : " NOT as written");
++	}
+ 	smmu_wr(s, 0x70, 0);                         /* sTLBGSYNC */
+ 	for (int n = 0; n < 100000 && (smmu_rd(s, 0x74) & 1u); n++) {
+ 		delay(1);
+ 	}
+-	smr = smmu_rd(s, 0x800 + 4 * slot);
+-	s2cr = smmu_rd(s, 0xc00 + 4 * slot);
+-	int ok = (smr >> 31) && (smr & 0xffffu) == sid && ((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == cb;
+-	printf("SWEET ASMMU: %s identity sid 0x%x mask 0x%x CB%u SMR%u: SMR 0x%08x S2CR 0x%08x SCTLR 0x%08x -> %s\n",
+-	    name, sid, mask, cb, slot, smr, s2cr, smmu_rd(cbp, 0x0), ok ? "OK" : "NOT as written");
+-	return ok ? 0 : -1;
++	printf("SWEET ASMMU: %s identity CB%u SCTLR 0x%08x: %s\n", name, cb, smmu_rd(cbp, 0x0), bad ? "INCOMPLETE" : "OK");
++	return bad ? -1 : 0;
+ }
+ 
+ /* SMC with arguments 3.. in a buffer (qcom_scm-smc.c, > 4 arguments). */
+@@ -1910,21 +1930,25 @@ sweet_smc_ext(uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_
+ static void
+ sweet_remote_heap(void)
+ {
+-	if (kmem_alloc_contig(kernel_map, &sweet_rheap_va, SWEET_RHEAP_SIZE, PAGE_MASK,
+-	    (ppnum_t)atop_64(0x100000000ull) - 1, (ppnum_t)atop_64(0x400000ull) - 1,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET FRPC: no %u-byte contiguous remote heap\n", SWEET_RHEAP_SIZE);
++	/*
++	 * 0127: k46 could not allocate 8 MiB below 4 GiB because XNU only
++	 * manages the upper DDR bank (grus ADT dram-base 0x1_0000_0000). The
++	 * low bank is not XNU's: its fixed carve-outs end at 0x9f800000
++	 * (qseecom), Linux allocates adsp_region dynamically from the rest.
++	 * Use 0xe0000000 (8 MiB heap) and 0xe0800000 (FastRPC argument block,
++	 * reachable by the ADSP's 32-bit DMA), mapped write-combined.
++	 */
++	sweet_rheap_pa = 0xe0000000ull;
++	sweet_rheap_va = ml_io_map_unmappable((vm_offset_t)sweet_rheap_pa, SWEET_RHEAP_SIZE + 0x4000, VM_WIMG_WCOMB);
++	if (!sweet_rheap_va) {
++		printf("SWEET FRPC: cannot map the remote heap\n");
+ 		return;
+ 	}
+-	ppnum_t p0 = pmap_find_phys(kernel_pmap, (addr64_t)sweet_rheap_va);
+-	ppnum_t p1 = pmap_find_phys(kernel_pmap, (addr64_t)sweet_rheap_va + SWEET_RHEAP_SIZE - PAGE_SIZE);
+-	sweet_rheap_pa = ptoa_64(p0);
+-	if (!p0 || ptoa_64(p1) != sweet_rheap_pa + SWEET_RHEAP_SIZE - PAGE_SIZE || (sweet_rheap_pa & 0x3fffffu) ||
+-	    sweet_rheap_pa + SWEET_RHEAP_SIZE > 0x100000000ull) {
+-		printf("SWEET FRPC: remote heap pa 0x%llx not usable\n", (unsigned long long)sweet_rheap_pa);
+-		return;
++	for (uint32_t o = 0; o < SWEET_RHEAP_SIZE + 0x4000; o += 8) {
++		*(volatile uint64_t *)(sweet_rheap_va + o) = 0;
+ 	}
+-	FlushPoC_DcacheRegion(sweet_rheap_va, SWEET_RHEAP_SIZE);
++	__asm__ volatile("dsb sy" ::: "memory");
++
+ 	/* qcom_scm_assign_mem: mem list @0, src vmids @64, dest perms @128, ext args @256 */
+ 	uint8_t *b = sweet_hyp_buf;
+ 	uint64_t bpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)b)) + ((uintptr_t)b & PAGE_MASK);
+@@ -1952,9 +1976,11 @@ sweet_remote_heap(void)
+ static uint64_t
+ sweet_frpc_create_static_args(uint32_t pgid)
+ {
+-	uint8_t *m = sweet_frpc_meta;
+-	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)m)) + ((uintptr_t)m & PAGE_MASK);
+-	bzero(m, sizeof(sweet_frpc_meta));
++	uint8_t *m = (uint8_t *)sweet_rheap_va + SWEET_RHEAP_SIZE;   /* write-combined, not assigned */
++	uint64_t pa = sweet_rheap_pa + SWEET_RHEAP_SIZE;
++	for (unsigned i = 0; i < 0x1000; i += 8) {
++		*(volatile uint64_t *)(void *)(m + i) = 0;
++	}
+ 	/* rpra[3] @0 (16 B), list[3] @48 (8 B), pages[3] @72 (16 B), fdlist @120, crclist @248, meta 504 */
+ 	static const uint32_t off[3] = { 512, 640, 768 }, len[3] = { 12, 8, 16 };
+ 	uint32_t inbuf[3] = { pgid, 8, 1 };
+@@ -1974,7 +2000,7 @@ sweet_frpc_create_static_args(uint32_t pgid)
+ 		p[0] = a & ~0xfffull;
+ 		p[1] = 0x1000;
+ 	}
+-	FlushPoC_DcacheRegion((vm_offset_t)m, sizeof(sweet_frpc_meta));
++	__asm__ volatile("dsb sy" ::: "memory");
+ 	return pa;
+ }
+ 
+@@ -3461,7 +3487,8 @@ sweet_adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 	sweet_apps_smmu_dump();
+ 	sweet_smem_list(0x1cf000, 0x30000, "apps<->adsp before");
+ 	(void)sweet_qmp_send("{class: image, res: load_state, name: adsp, val: on}");
+-	(void)sweet_apps_smmu_identity(0x1800, 0xf, "ADSP audio/FastRPC");
++	static const uint16_t adsp_sids[] = { 0x1801, 0x1803, 0x1804, 0x1805, 0x1806 };
++	(void)sweet_apps_smmu_identity(adsp_sids, 5, "ADSP audio/FastRPC");
+ 	sweet_remote_heap();
+ 	if (sweet_pas_boot("adsp", 1, 0x93e00000u, 0x2200000u) == 0) {
+ 		ud_sleep_ms(2000);
