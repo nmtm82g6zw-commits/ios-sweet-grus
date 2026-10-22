@@ -1,0 +1,351 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index d05c279..c64c1a3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -3675,7 +3675,7 @@ mss_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned
+ 	return v | 0x80000000u;   /* caller compares with want */
+ }
+ 
+-static void
++static int
+ sweet_modem_mba(void)
+ {
+ 	printf("SWEET MSS: MBA bring-up starting\n");
+@@ -3685,7 +3685,7 @@ sweet_modem_mba(void)
+ 	if (SecureDTLookupEntry(NULL, "/sweet-rproc", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "modem-mba", &mba, &mba_size) != kSuccess || mba_size == 0 || mba_size > 0x100000) {
+ 		printf("SWEET MSS: no modem-mba in the ADT (%u bytes)\n", mba_size);
+-		return;
++		return -1;
+ 	}
+ 	vm_offset_t gcc = ml_io_map(0x100000, 0x90000);
+ 	vm_offset_t q6 = ml_io_map(0x04080000, 0x4000);
+@@ -3694,7 +3694,7 @@ sweet_modem_mba(void)
+ 	vm_offset_t pdc = ml_io_map(0x0b2e0000, 0x4000);
+ 	if (!gcc || !q6 || !rmb || !aoss || !pdc) {
+ 		printf("SWEET MSS: map failed\n");
+-		return;
++		return -1;
+ 	}
+ 	(void)sweet_qmp_send("{class: image, res: load_state, name: modem, val: on}");
+ 	int e1 = sweet_rpmh_arc_vote("cx.lvl", 0xffff);
+@@ -3703,7 +3703,7 @@ sweet_modem_mba(void)
+ 	printf("SWEET MSS: ARC votes cx %d mx %d mss %d\n", e1, e2, e3);
+ 	if (e3) {
+ 		printf("SWEET MSS: no MSS rail vote, stopping before touching the modem\n");
+-		return;
++		return -1;
+ 	}
+ 	/* proxy prng + reset clocks */
+ 	*(volatile uint32_t *)(gcc + 0x52004) = usb_rd(gcc, 0x52004) | (1u << 13);
+@@ -3714,7 +3714,7 @@ sweet_modem_mba(void)
+ 	printf("SWEET MSS: mss_cfg_ahb 0x%08x snoc_axi 0x%08x prng 0x%08x\n", c1, c2, usb_rd(gcc, 0x34004));
+ 	if ((c1 | c2) & 0x80000000u) {
+ 		printf("SWEET MSS: reset clocks did not turn on, stopping\n");
+-		return;
++		return -1;
+ 	}
+ 	/* reset deassert, alt-reset flavour */
+ 	*(volatile uint32_t *)(pdc + 0x100) = usb_rd(pdc, 0x100) | (1u << 9);
+@@ -3740,7 +3740,7 @@ sweet_modem_mba(void)
+ 	/* MBA image */
+ 	vm_offset_t mm = ml_io_map_unmappable(0x93c00000, 0x200000, VM_WIMG_WCOMB);
+ 	if (!mm) {
+-		return;
++		return -1;
+ 	}
+ 	for (uint32_t o = 0; o < 0x200000; o += 8) {
+ 		*(volatile uint64_t *)(mm + o) = 0;
+@@ -3754,7 +3754,7 @@ sweet_modem_mba(void)
+ 	printf("SWEET MSS: MBA %u bytes at 0x93c00000; hyp_assign mpss -> %lld, mba -> %lld\n", mba_size,
+ 	    (long long)r1, (long long)r2);
+ 	if (r1 || r2) {
+-		return;
++		return -1;
+ 	}
+ 	*(volatile uint32_t *)(rmb + 0x00) = 0x93c00000u;          /* RMB_MBA_IMAGE */
+ 	/* q6v5proc_reset, MSS_SDM845 */
+@@ -3763,7 +3763,7 @@ sweet_modem_mba(void)
+ 	uint32_t sl = mss_poll(q6, 0x3c, 1u << 31, 0, 200);
+ 	printf("SWEET MSS: QDSP6SS_SLEEP 0x%08x\n", sl);
+ 	if (sl & 0x80000000u) {
+-		return;
++		return -1;
+ 	}
+ 	*(volatile uint32_t *)(q6 + 0x400) = 1;                    /* BOOT_CORE_START */
+ 	*(volatile uint32_t *)(q6 + 0x404) = 1;                    /* BOOT_CMD */
+@@ -3785,6 +3785,226 @@ sweet_modem_mba(void)
+ 	}
+ 	printf("SWEET MSS: MBA status %d (%s)\n", st,
+ 	    st == 1 ? "XPU unlocked" : st == 2 ? "XPU unlocked, scribbled" : st < 0 ? "MBA error" : "timeout/unexpected");
++	return (st == 1 || st == 2) ? 0 : -1;
++}
++
++/*
++ * 0136: k54 brought the MBA up (boot FSM 0x9, PBL 1, MBA status 2 = XPU
++ * unlocked, scribbled). Now q6v5_mpss_load for sdm845:
++ *  - metadata = ELF header + program headers (modem.mdt) + the hash
++ *    segment (modem.b01, qcom_mdt_read_metadata), in low-bank RAM at
++ *    0xe0900000, hyp_assign'ed to MSS_MSA, RMB_PMI_META_DATA + command
++ *    META_DATA_READY, wait for status 3, reclaim;
++ *  - mpss region shared HLOS RWX + MSS RW while the 31 loadable segments
++ *    (modem.bNN from the ADT) are copied/zero-filled, RMB_PMI_CODE_START =
++ *    0x8b000000 + LOAD_READY on the first one, RMB_PMI_CODE_LENGTH grows
++ *    with each p_memsz;
++ *  - mpss back to MSS only, wait for status 4 (AUTH_COMPLETE), then watch
++ *    the modem: SMEM crash reason 421 and the apps<->modem partition.
++ * sweetmodem=3 (MBA + MPSS).
++ */
++static uint64_t
++sweet_hyp_assign2(uint64_t pa, uint64_t size, const uint32_t *src, unsigned ns,
++    const uint32_t *vmid, const uint32_t *perm, unsigned n)
++{
++	uint8_t *b = sweet_hyp_buf2;
++	uint64_t bpa = ml_static_vtop((vm_offset_t)b);
++	bzero(b, 512);
++	((uint64_t *)(void *)b)[0] = pa;
++	((uint64_t *)(void *)b)[1] = size;
++	for (unsigned i = 0; i < ns && i < 4; i++) {
++		((uint32_t *)(void *)(b + 64))[i] = src[i];
++	}
++	uint32_t *d = (uint32_t *)(void *)(b + 128);
++	for (unsigned i = 0; i < n && i < 4; i++) {
++		d[6 * i] = vmid[i];
++		d[6 * i + 1] = perm[i];
++	}
++	uint64_t *ext = (uint64_t *)(void *)(b + 256);
++	ext[0] = 4u * ns;
++	ext[1] = bpa + 128;
++	ext[2] = 24u * n;
++	ext[3] = 0;
++	FlushPoC_DcacheRegion((vm_offset_t)b, 512);
++	return sweet_smc_ext(0x0c, 0x16, 0x1117, bpa, 16, bpa + 64, bpa + 256);
++}
++
++static int32_t
++mss_mba_wait(vm_offset_t rmb, int32_t want, int ms)
++{
++	int32_t v = 0;
++	for (int i = 0; i < ms; i++) {
++		v = (int32_t)usb_rd(rmb, 0x0c);
++		if (v < 0 || (want == 0 ? v != 0 : v == want)) {
++			return v;
++		}
++		ud_sleep_ms(1);
++	}
++	return 0x7fffffff;      /* timeout */
++}
++
++static void
++sweet_modem_mpss(void)
++{
++	DTEntry node;
++	void const *mdt = NULL, *hash = NULL;
++	unsigned int mdt_size = 0, hash_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-rproc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "modem-mdt", &mdt, &mdt_size) != kSuccess || mdt_size < 52) {
++		printf("SWEET MSS: no modem-mdt in the ADT\n");
++		return;
++	}
++	const uint8_t *e = mdt;
++	uint32_t phoff = *(const uint32_t *)(e + 28);
++	unsigned phnum = *(const uint16_t *)(e + 44);
++	uint32_t hdr = phoff + 32u * phnum;
++	if (phnum > 64 || hdr > mdt_size) {
++		printf("SWEET MSS: bad mdt header\n");
++		return;
++	}
++	unsigned hidx = ~0u;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + 32 * i);
++		if (((ph[6] >> 24) & 7u) == 2) {
++			hidx = i;
++		}
++	}
++	char prop[16];
++	if (hidx == ~0u) {
++		printf("SWEET MSS: no hash segment\n");
++		return;
++	}
++	const uint32_t *hph = (const uint32_t *)(e + phoff + 32 * hidx);
++	if (hph[1] + hph[4] <= mdt_size) {
++		hash = e + hph[1];
++		hash_size = hph[4];
++	} else {
++		snprintf(prop, sizeof(prop), "modem-b%02u", hidx);
++		if (SecureDTGetProperty(node, prop, &hash, &hash_size) != kSuccess || hash_size < hph[4]) {
++			printf("SWEET MSS: hash segment %s missing\n", prop);
++			return;
++		}
++		hash_size = hph[4];
++	}
++	vm_offset_t rmb = ml_io_map(0x04180000, 0x4000);
++	if (!rmb) {
++		return;
++	}
++	*(volatile uint32_t *)(rmb + 0x18) = 0;                 /* RMB_PMI_CODE_LENGTH */
++	/* metadata */
++	const uint64_t md_pa = 0xe0900000ull;
++	uint32_t md_size = (hdr + hash_size + 0xfffu) & ~0xfffu;
++	vm_offset_t md = ml_io_map_unmappable((vm_offset_t)md_pa, (md_size + 0x3fffu) & ~0x3fffu, VM_WIMG_WCOMB);
++	if (!md) {
++		return;
++	}
++	for (uint32_t o = 0; o < md_size; o += 8) {
++		*(volatile uint64_t *)(md + o) = 0;
++	}
++	bcopy(e, (void *)md, hdr);
++	bcopy(hash, (void *)(md + hdr), hash_size);
++	__asm__ volatile("dsb sy" ::: "memory");
++	static const uint32_t hlos[1] = { 3 }, mss[1] = { 15 }, both[2] = { 3, 15 };
++	static const uint32_t rw[1] = { 6 }, rwx[1] = { 7 }, both_perm[2] = { 7, 6 };
++	uint64_t r = sweet_hyp_assign2(md_pa, md_size, hlos, 1, mss, rw, 1);
++	printf("SWEET MSS: metadata %u + %u bytes (hash = phdr %u) at 0x%llx, assign -> %lld\n", hdr, hash_size, hidx,
++	    (unsigned long long)md_pa, (long long)r);
++	if (r) {
++		return;
++	}
++	*(volatile uint32_t *)(rmb + 0x10) = (uint32_t)md_pa;   /* RMB_PMI_META_DATA */
++	*(volatile uint32_t *)(rmb + 0x08) = 1;                 /* META_DATA_READY */
++	__asm__ volatile("dsb sy" ::: "memory");
++	int32_t st = mss_mba_wait(rmb, 3, 1000);
++	printf("SWEET MSS: metadata authentication: status %d (3 = success)\n", st);
++	r = sweet_hyp_assign2(md_pa, md_size, mss, 1, hlos, rwx, 1);
++	if (st != 3) {
++		return;
++	}
++	/* share mpss during loading */
++	r = sweet_hyp_assign2(0x8b000000, 0x7e00000, mss, 1, both, both_perm, 2);
++	printf("SWEET MSS: mpss shared HLOS+MSS -> %lld\n", (long long)r);
++	if (r) {
++		return;
++	}
++	vm_offset_t mem = ml_io_map_unmappable(0x8b000000, 0x7e00000, VM_WIMG_WCOMB);
++	if (!mem) {
++		return;
++	}
++	uint32_t size = 0, nseg = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(e + phoff + 32 * i);
++		if (ph[0] != 1 || ((ph[6] >> 24) & 7u) == 2 || ph[5] == 0) {
++			continue;
++		}
++		uint32_t off = ph[3] - 0x8b000000u;
++		if (ph[3] < 0x8b000000u || off + ph[5] > 0x7e00000u || ph[4] > ph[5]) {
++			printf("SWEET MSS: segment %u outside the region\n", i);
++			goto out;
++		}
++		void const *seg = NULL;
++		unsigned int seg_size = 0;
++		if (ph[4]) {
++			snprintf(prop, sizeof(prop), "modem-b%02u", i);
++			if (SecureDTGetProperty(node, prop, &seg, &seg_size) != kSuccess || seg_size < ph[4]) {
++				printf("SWEET MSS: %s missing\n", prop);
++				goto out;
++			}
++			bcopy(seg, (void *)(mem + off), ph[4]);
++		}
++		for (uint32_t z = ph[4]; z < ph[5]; z += 4) {
++			*(volatile uint32_t *)(mem + off + z) = 0;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		size += ph[5];
++		nseg++;
++		if (usb_rd(rmb, 0x18) == 0) {
++			*(volatile uint32_t *)(rmb + 0x14) = 0x8b000000u;  /* RMB_PMI_CODE_START */
++			*(volatile uint32_t *)(rmb + 0x08) = 2;            /* LOAD_READY */
++		}
++		*(volatile uint32_t *)(rmb + 0x18) = size;
++		__asm__ volatile("dsb sy" ::: "memory");
++		st = (int32_t)usb_rd(rmb, 0x0c);
++		if (st < 0) {
++			printf("SWEET MSS: authentication failed at segment %u: %d\n", i, st);
++			goto out;
++		}
++	}
++	printf("SWEET MSS: %u segments, 0x%x bytes loaded\n", nseg, size);
++out:
++	sweet_io_unmap(mem, 0x7e00000);
++	r = sweet_hyp_assign2(0x8b000000, 0x7e00000, both, 2, mss, rw, 1);
++	printf("SWEET MSS: mpss back to MSS only -> %lld\n", (long long)r);
++	st = mss_mba_wait(rmb, 4, 10000);
++	printf("SWEET MSS: MPSS authentication: status %d (4 = AUTH_COMPLETE)\n", st);
++	if (st != 4) {
++		return;
++	}
++	vm_offset_t g = ml_io_map_unmappable(0x86000000, 0x200000, VM_WIMG_IO);
++	for (int i = 0; g && i < 30; i++) {
++		ud_sleep_ms(1000);
++		vm_offset_t toc = g + 64 + 128 + 12 + 421 * 16;
++		uint32_t alloc = usb_rd(toc, 0), off2 = usb_rd(toc, 4);
++		char cr[64] = { 0 };
++		for (uint32_t k = 0; alloc == 1 && k < sizeof(cr) - 1; k++) {
++			uint32_t w = usb_rd(g + off2, k & ~3u);
++			char c = (char)(w >> (8 * (k & 3u)));
++			if (!c) {
++				break;
++			}
++			cr[k] = (c >= 32 && c < 127) ? c : '.';
++		}
++		if (i % 5 == 4 || cr[0]) {
++			printf("SWEET MSS: +%d s modem crash reason \"%s\"\n", i + 1, cr);
++		}
++		if (cr[0]) {
++			break;
++		}
++	}
++	if (g) {
++		sweet_io_unmap(g, 0x200000);
++	}
++	sweet_smem_list(0x11d000, 0x30000, "apps<->modem");
+ }
+ 
+ static void
+@@ -3793,8 +4013,10 @@ sweet_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	ud_sleep_ms(75000);
+ 	int mode = 1;
+ 	PE_parse_boot_argn("sweetmodem", &mode, sizeof(mode));
+-	if (mode == 2) {
+-		sweet_modem_mba();
++	if (mode == 2 || mode == 3) {
++		if (sweet_modem_mba() == 0 && mode == 3) {
++			sweet_modem_mpss();
++		}
+ 		(void)thread_terminate(current_thread());
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 9497377..f11a5a3 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -539,18 +539,24 @@ sweet_rpmh_arc_vote(const char *res, unsigned vlvl)
+ 		printf("SWEET RPMH: %s: ARC entry not usable (matches %u addr %#x aux %u)\n", res, matches, addr, auxlen);
+ 		error = ENODEV;
+ 	}
++	/* grus 0136: the aux table is zero-padded; the top level is the last
++	 * non-zero entry (k54 voted hlvl 15 = a padding slot). */
++	unsigned top = 0;
+ 	for (unsigned i = 0; !error && i < n; ++i) {
+-		if (rh_db16(aux + 2 * i) >= vlvl) {
++		unsigned v = rh_db16(aux + 2 * i);
++		if (v) {
++			top = i;
++		}
++		if (hlvl == ~0u && v >= vlvl && (v || i == 0)) {
+ 			hlvl = i;
+-			break;
+ 		}
+ 	}
+-	if (!error && hlvl == ~0u) {
+-		hlvl = n - 1;
++	if (!error && (hlvl == ~0u || hlvl > top)) {
++		hlvl = top;
+ 	}
+ 	if (!error) {
+-		printf("SWEET RPMH: %s addr %#x vlvl %u -> hlvl %u (table top %u)\n", res, addr, vlvl, hlvl,
+-		    rh_db16(aux + 2 * (n - 1)));
++		printf("SWEET RPMH: %s addr %#x vlvl %u -> hlvl %u (vlvl %u; top hlvl %u)\n", res, addr, vlvl, hlvl,
++		    rh_db16(aux + 2 * hlvl), top);
+ 		uint32_t v = hlvl;
+ 		error = rh_send_n(&addr, &v, 1);
+ 	}
