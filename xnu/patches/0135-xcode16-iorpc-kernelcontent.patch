@@ -1,0 +1,20 @@
+diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+index 3ded78c..038eb12 100644
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,15 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/*
++	 * grus 0135: Xcode 16's iig (macos-14 runners retire 2026-11-02; only
++	 * Xcode 16+ remains) emits dispatchers that read rpc.kernelContent, as
++	 * in xnu-10063+. Nothing in this iOS kernel serves DriverKit RPC, so
++	 * the field is only declared (zero in every initializer here).
++	 */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
