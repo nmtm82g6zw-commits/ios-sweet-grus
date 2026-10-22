@@ -13,6 +13,8 @@ GMU ITCM/DTCM (a630 "legacy" image: raw Cortex-M3 memory, 32 KiB).
 --sqe FILE adds the CP microcode as sqe-fw (sweet_gpu_cp_test, sweetgpu=6).
 --rproc NAME=PREFIX (repeatable) adds node /sweet-rproc with NAME-mdt and
 NAME-bNN from PREFIX.mdt / PREFIX.bNN (sweet_pas_boot, e.g. adsp, sweetadsp=1).
+--rblob NAME=FILE (repeatable) adds FILE as property NAME of /sweet-rproc
+(e.g. modem-mba=.../mba.mbn for the modem's MBA, sweetmodem=2).
 """
 import os, struct, sys
 
@@ -43,9 +45,10 @@ if zap:
 n.children = []
 root.children.append(n)
 rprocs = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == '--rproc']
+rblobs = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == '--rblob']
 root.children = [c for c in root.children
                  if dict((k, v) for k, f, v in c.props).get('name') != b'sweet-rproc\0']
-if rprocs:
+if rprocs or rblobs:
     r = adt.Node()
     r.props = [('name', 0, b'sweet-rproc\0'), ('AAPL,phandle', 0, struct.pack('<I', 901))]
     r.children = []
@@ -56,6 +59,9 @@ if rprocs:
             seg = '%s.b%02d' % (prefix, i)
             if os.path.exists(seg):
                 r.props.append(('%s-b%02d' % (rname, i), 0, open(seg, 'rb').read()))
+    for spec in rblobs:
+        bname, path = spec.split('=', 1)
+        r.props.append((bname, 0, open(path, 'rb').read()))
     root.children.append(r)
 blob = adt.serialize(root)
 open(dst, 'wb').write(blob)

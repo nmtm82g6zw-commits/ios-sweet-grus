@@ -1,0 +1,395 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index de3ba79..d05c279 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -3616,10 +3616,188 @@ sweet_apps_smmu_dump(void)
+  * modem.mdt/.bNN from the ADT (adt-add-gpu-fw.py --rproc modem=...).
+  * Boot-arg sweetmodem=1.
+  */
++/*
++ * 0134: modem via the MBA, as Linux qcom_q6v5_mss.c does for sdm845
++ * (grus DT qcom,mss@4080000 "qcom,pil-q6v55-mss", qdsp6v65-1-0, self-auth):
++ * k53 showed TZ refusing PAS_INIT_IMAGE for id 4. q6v5_mba_load:
++ *  - AOSS load_state modem; RPMh ARC votes cx/mx/mss at their top level;
++ *  - GCC clocks: proxy xo (always on) + prng (0x52004 b13), reset iface
++ *    (mss_cfg_ahb 0x8a000) + snoc_axi (0x8a150), active bus (q6_memnoc_axi
++ *    0x8a154) + mem (boot_rom_ahb 0x52004 b10) + gpll0_mss (0x52004 b17) +
++ *    mnoc_axi (mfab_axis 0x8a004);
++ *  - reset deassert with alt reset: PDC sync 0xb2e0100 bit 9 held, RMB
++ *    ALT_RESET 1, AOSS mss restart 0xc2b0000 pulsed, ALT_RESET 0, PDC off;
++ *  - MBA (modem-mba from the ADT) copied to mba region 0x93c00000; mpss
++ *    0x8b000000+0x7e00000 and the MBA region hyp_assign'ed HLOS -> MSS_MSA
++ *    (VMID 15) RW;
++ *  - RMB_MBA_IMAGE = MBA address; Q6 boot FSM: QDSP6SS_SLEEP clk enable,
++ *    BOOT_CORE_START, BOOT_CMD, wait RMB MSS_STATUS bit 0; PBL status;
++ *    MBA status 1/2 = XPU unlocked. Stops there (no MPSS load yet).
++ * Boot-arg sweetmodem=2.
++ */
++extern int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);
++static uint8_t sweet_hyp_buf2[0x1000] __attribute__((aligned(0x1000)));
++
++static uint64_t
++sweet_hyp_assign(uint64_t pa, uint64_t size, uint32_t src_vmid, const uint32_t *vmid, const uint32_t *perm, unsigned n)
++{
++	uint8_t *b = sweet_hyp_buf2;
++	uint64_t bpa = ml_static_vtop((vm_offset_t)b);
++	bzero(b, 512);
++	((uint64_t *)(void *)b)[0] = pa;
++	((uint64_t *)(void *)b)[1] = size;
++	*(uint32_t *)(void *)(b + 64) = src_vmid;
++	uint32_t *d = (uint32_t *)(void *)(b + 128);
++	for (unsigned i = 0; i < n && i < 4; i++) {
++		d[6 * i] = vmid[i];
++		d[6 * i + 1] = perm[i];
++	}
++	uint64_t *ext = (uint64_t *)(void *)(b + 256);
++	ext[0] = 4;
++	ext[1] = bpa + 128;
++	ext[2] = 24u * n;
++	ext[3] = 0;
++	FlushPoC_DcacheRegion((vm_offset_t)b, 512);
++	return sweet_smc_ext(0x0c, 0x16, 0x1117, bpa, 16, bpa + 64, bpa + 256);
++}
++
++static uint32_t
++mss_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	uint32_t v = 0;
++	for (unsigned i = 0; i <= us; i++) {
++		v = usb_rd(base, off);
++		if ((v & mask) == want) {
++			return v;
++		}
++		delay(1);
++	}
++	return v | 0x80000000u;   /* caller compares with want */
++}
++
++static void
++sweet_modem_mba(void)
++{
++	printf("SWEET MSS: MBA bring-up starting\n");
++	DTEntry node;
++	void const *mba = NULL;
++	unsigned int mba_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-rproc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "modem-mba", &mba, &mba_size) != kSuccess || mba_size == 0 || mba_size > 0x100000) {
++		printf("SWEET MSS: no modem-mba in the ADT (%u bytes)\n", mba_size);
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(0x100000, 0x90000);
++	vm_offset_t q6 = ml_io_map(0x04080000, 0x4000);
++	vm_offset_t rmb = ml_io_map(0x04180000, 0x4000);
++	vm_offset_t aoss = ml_io_map(0x0c2b0000, 0x4000);
++	vm_offset_t pdc = ml_io_map(0x0b2e0000, 0x4000);
++	if (!gcc || !q6 || !rmb || !aoss || !pdc) {
++		printf("SWEET MSS: map failed\n");
++		return;
++	}
++	(void)sweet_qmp_send("{class: image, res: load_state, name: modem, val: on}");
++	int e1 = sweet_rpmh_arc_vote("cx.lvl", 0xffff);
++	int e2 = sweet_rpmh_arc_vote("mx.lvl", 0xffff);
++	int e3 = sweet_rpmh_arc_vote("mss.lvl", 0xffff);
++	printf("SWEET MSS: ARC votes cx %d mx %d mss %d\n", e1, e2, e3);
++	if (e3) {
++		printf("SWEET MSS: no MSS rail vote, stopping before touching the modem\n");
++		return;
++	}
++	/* proxy prng + reset clocks */
++	*(volatile uint32_t *)(gcc + 0x52004) = usb_rd(gcc, 0x52004) | (1u << 13);
++	*(volatile uint32_t *)(gcc + 0x8a000) = usb_rd(gcc, 0x8a000) | 1u;
++	*(volatile uint32_t *)(gcc + 0x8a150) = usb_rd(gcc, 0x8a150) | 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t c1 = mss_poll(gcc, 0x8a000, 1u << 31, 0, 200), c2 = mss_poll(gcc, 0x8a150, 1u << 31, 0, 200);
++	printf("SWEET MSS: mss_cfg_ahb 0x%08x snoc_axi 0x%08x prng 0x%08x\n", c1, c2, usb_rd(gcc, 0x34004));
++	if ((c1 | c2) & 0x80000000u) {
++		printf("SWEET MSS: reset clocks did not turn on, stopping\n");
++		return;
++	}
++	/* reset deassert, alt-reset flavour */
++	*(volatile uint32_t *)(pdc + 0x100) = usb_rd(pdc, 0x100) | (1u << 9);
++	*(volatile uint32_t *)(rmb + 0x44) = 1;
++	*(volatile uint32_t *)(aoss) = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++	delay(300);
++	*(volatile uint32_t *)(aoss) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	delay(300);
++	*(volatile uint32_t *)(rmb + 0x44) = 0;
++	*(volatile uint32_t *)(pdc + 0x100) = usb_rd(pdc, 0x100) & ~(1u << 9);
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* active clocks */
++	*(volatile uint32_t *)(gcc + 0x8a154) = usb_rd(gcc, 0x8a154) | 1u;
++	*(volatile uint32_t *)(gcc + 0x8a004) = usb_rd(gcc, 0x8a004) | 1u;
++	*(volatile uint32_t *)(gcc + 0x52004) = usb_rd(gcc, 0x52004) | (1u << 10) | (1u << 17);
++	__asm__ volatile("dsb sy" ::: "memory");
++	delay(10);
++	printf("SWEET MSS: after reset: aoss 0x%x pdc 0x%x; q6_memnoc 0x%08x mfab 0x%08x boot_rom 0x%08x vote 0x%08x\n",
++	    usb_rd(aoss, 0), usb_rd(pdc, 0x100), usb_rd(gcc, 0x8a154), usb_rd(gcc, 0x8a004), usb_rd(gcc, 0x38004),
++	    usb_rd(gcc, 0x52004));
++	/* MBA image */
++	vm_offset_t mm = ml_io_map_unmappable(0x93c00000, 0x200000, VM_WIMG_WCOMB);
++	if (!mm) {
++		return;
++	}
++	for (uint32_t o = 0; o < 0x200000; o += 8) {
++		*(volatile uint64_t *)(mm + o) = 0;
++	}
++	bcopy(mba, (void *)mm, mba_size);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_io_unmap(mm, 0x200000);
++	static const uint32_t vm15[1] = { 15 }, rw[1] = { 6 };
++	uint64_t r1 = sweet_hyp_assign(0x8b000000, 0x7e00000, 3, vm15, rw, 1);
++	uint64_t r2 = sweet_hyp_assign(0x93c00000, 0x200000, 3, vm15, rw, 1);
++	printf("SWEET MSS: MBA %u bytes at 0x93c00000; hyp_assign mpss -> %lld, mba -> %lld\n", mba_size,
++	    (long long)r1, (long long)r2);
++	if (r1 || r2) {
++		return;
++	}
++	*(volatile uint32_t *)(rmb + 0x00) = 0x93c00000u;          /* RMB_MBA_IMAGE */
++	/* q6v5proc_reset, MSS_SDM845 */
++	*(volatile uint32_t *)(q6 + 0x3c) = usb_rd(q6, 0x3c) | 1u;  /* QDSP6SS_SLEEP clk enable */
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t sl = mss_poll(q6, 0x3c, 1u << 31, 0, 200);
++	printf("SWEET MSS: QDSP6SS_SLEEP 0x%08x\n", sl);
++	if (sl & 0x80000000u) {
++		return;
++	}
++	*(volatile uint32_t *)(q6 + 0x400) = 1;                    /* BOOT_CORE_START */
++	*(volatile uint32_t *)(q6 + 0x404) = 1;                    /* BOOT_CMD */
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t fsm = mss_poll(rmb, 0x40, 1u, 1u, 10000);
++	printf("SWEET MSS: boot FSM RMB_MSS_STATUS 0x%08x%s\n", fsm, (fsm & 0x80000000u) ? " TIMEOUT" : "");
++	uint32_t pbl = 0;
++	for (int i = 0; i < 1000 && !(pbl = usb_rd(rmb, 0x04)); i++) {
++		ud_sleep_ms(1);
++	}
++	printf("SWEET MSS: PBL status 0x%x (1 = success)\n", pbl);
++	int32_t st = 0;
++	for (int i = 0; i < 5000; i++) {
++		st = (int32_t)usb_rd(rmb, 0x0c);
++		if (st) {
++			break;
++		}
++		ud_sleep_ms(1);
++	}
++	printf("SWEET MSS: MBA status %d (%s)\n", st,
++	    st == 1 ? "XPU unlocked" : st == 2 ? "XPU unlocked, scribbled" : st < 0 ? "MBA error" : "timeout/unexpected");
++}
++
+ static void
+ sweet_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	ud_sleep_ms(75000);
++	int mode = 1;
++	PE_parse_boot_argn("sweetmodem", &mode, sizeof(mode));
++	if (mode == 2) {
++		sweet_modem_mba();
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ 	printf("SWEET MODEM: PAS boot starting\n");
+ 	(void)sweet_qmp_send("{class: image, res: load_state, name: modem, val: on}");
+ 	int r = sweet_pas_boot("modem", 4, 0x8b000000u, 0x7e00000u);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 8017d3a..9497377 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -332,6 +332,119 @@ rh_send(uint32_t address, unsigned mv)
+ 	return 0;
+ }
+ 
++/*
++ * grus 0134: the same ACTIVE-TCS transaction as rh_send, for n (<= 3) raw
++ * commands - used for ARC level votes (one command: hlvl index).
++ */
++static int
++rh_send_n(const uint32_t *addrs, const uint32_t *vals, unsigned n)
++{
++	uint32_t address = addrs[0];
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; ++c) {
++			if ((enabled & (1u << c)) &&
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		/* No payload was touched. Do not acknowledge somebody else's IRQ. */
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	/* From here an uncertain write/timeout quarantines our slot for this boot. */
++	rh_poisoned = true;
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	if (n == 0 || n > 3) {
++		return EINVAL;
++	}
++	uint32_t mask = (1u << n) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE %u cmds, first %#x=%#x irq-enable=%#x\n", t, n, addrs[0], vals[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
++		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
++		    !rh_sync(cmd + RH_DATA, vals[c])) {
++			return EIO;
++		}
++	}
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < n; ++c) {
++			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++			complete &= status[c] != 0xffffffffu &&
++			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		}
++		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	if (!done) {
++		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		return ETIMEDOUT;
++	}
++	/* Proven completion: clear trigger before mode, then free only our commands. */
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	printf("SWEET RPMH: %#x ACTIVE request complete\n", address);
++	return 0;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -374,4 +487,77 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * grus 0134: ARC level vote (Linux rpmhpd): cmd-db slave 3 entry, aux data
++ * = u16 voltage level (vlvl) per hardware level; the vote is the lowest
++ * hlvl whose vlvl >= the requested one. Only cx.lvl / mx.lvl / mss.lvl.
++ */
++int sweet_rpmh_arc_vote(const char *res, unsigned vlvl);
++
++int
++sweet_rpmh_arc_vote(const char *res, unsigned vlvl)
++{
++	if (!res || (strcmp(res, "cx.lvl") && strcmp(res, "mx.lvl") && strcmp(res, "mss.lvl"))) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_poisoned ? EIO : rh_map();
++	uint32_t key[2] = {0, 0}, addr = 0, aux = 0, auxlen = 0;
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; !error && i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t auxbase = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (!rh_range(entries, count * RH_DB_ENTRY)) {
++			error = EINVAL;
++			break;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			addr = rh_read(rh_db, e + 16);
++			aux = auxbase + rh_db16(e + 22);
++			auxlen = rh_db16(e + 20);
++			matches += (slave == 3);
++		}
++	}
++	unsigned hlvl = ~0u, n = auxlen / 2;
++	if (!error && (matches != 1 || (addr >> 16) != 3 || !rh_range(aux, auxlen) || n == 0 || n > 16)) {
++		printf("SWEET RPMH: %s: ARC entry not usable (matches %u addr %#x aux %u)\n", res, matches, addr, auxlen);
++		error = ENODEV;
++	}
++	for (unsigned i = 0; !error && i < n; ++i) {
++		if (rh_db16(aux + 2 * i) >= vlvl) {
++			hlvl = i;
++			break;
++		}
++	}
++	if (!error && hlvl == ~0u) {
++		hlvl = n - 1;
++	}
++	if (!error) {
++		printf("SWEET RPMH: %s addr %#x vlvl %u -> hlvl %u (table top %u)\n", res, addr, vlvl, hlvl,
++		    rh_db16(aux + 2 * (n - 1)));
++		uint32_t v = hlvl;
++		error = rh_send_n(&addr, &v, 1);
++	}
++	if (error) {
++		printf("SWEET RPMH: %s vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
